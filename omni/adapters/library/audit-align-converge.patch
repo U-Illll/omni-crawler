@@ -1,0 +1,35 @@
+--- a/scrape.py
++++ b/scrape.py
+@@ -1833,7 +1833,9 @@
+ #   exit 4  停滞自停：SCRAPE_STALL_ACTION=stop 且进度年龄 ≥ 自停阈值
+ #   报告：OUT/convergence-report.json（r3-convergence-v1，含 decided/terminal/exit_code/缺口清单）
+ #
+-# 二、审计事件（每行 JSON → OUT/audit.jsonl，遵循 R3/refs/r3-audit-schema.md）
++# 二、审计事件（每行 JSON → OUT/audit.jsonl，遵循 R3-P4 契约 v2 refs/audit-contract-v2.md）
++#   行布局（契约 §1，三写者统一）：schema="r3-audit-v2" / ts_epoch(权威) / ts_iso / pid /
++#   seq(进程内从 1) / level / event / detail；**不再写遗留键 ts**（历史 ts 语义三侧不一）。
+ #   block   : probe_all_dead / probe_incomplete / probe_retry / repair_round_enter /
+ #             repair_round_result / repair_exhausted / convergence_decision / stall_detected
+ #   request : error_classified（F2 的 200-缺-info 等；按 (class, where) 限流防洪泛）
+@@ -1848,7 +1850,7 @@
+ #             ④预算耗尽：缺口标 terminal ⇒ 收敛判据判"未收敛"（exit 3），不洗成完成
+ # ===========================================================================
+ 
+-R3_AUDIT_SCHEMA = 'r3-audit-v1'
++R3_AUDIT_SCHEMA = 'r3-audit-v2'    # R3-P4 契约 v2 §1：三写者统一 schema 值（原 r3-audit-v1）
+ EXIT_CONVERGED = 0
+ EXIT_INCOMPLETE = int(_env_num('SCRAPE_INCOMPLETE_EXIT', 3, int))   # 未收敛退出码（可配 0 兼容旧 keeper）
+ EXIT_STALL_STOP = int(_env_num('SCRAPE_STALL_EXIT', 4, int))
+@@ -1933,9 +1935,10 @@
+     try:
+         with _AUDIT_LOCK:
+             _AUDIT_SEQ += 1
+-            ev = {'ts': round(time.time(), 3),
++            ev = {'schema': R3_AUDIT_SCHEMA,
++                  'ts_epoch': round(time.time(), 3),      # 契约 v2：权威时间键
+                   'ts_iso': datetime.now().isoformat(timespec='milliseconds'),
+-                  'pid': os.getpid(), 'seq': _AUDIT_SEQ, 'schema': R3_AUDIT_SCHEMA,
++                  'pid': os.getpid(), 'seq': _AUDIT_SEQ,
+                   'level': level, 'event': event, 'run': run or _r3_run_id(),
+                   'detail': detail if isinstance(detail, dict) else {'value': detail}}
+             blob = (json.dumps(ev, ensure_ascii=False) + '\n').encode('utf-8')

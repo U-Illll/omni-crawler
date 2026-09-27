@@ -1,0 +1,19 @@
+# 运行时数据与本地环境（不入库）
+runs/
+logs/
+state/
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.pid
+*.log
+!tests/*.log
+
+# 演练/测试产物（运行时生成，不入库）
+omni/adapters/library/sandbox/
+omni/adapters/library/sandbox-test/
+omni/adapters/library/test-results/
+
+# 资产盘点文档（含服务器/凭据信息，不入库）
+docs/inventory.md

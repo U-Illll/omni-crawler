@@ -1,0 +1,22 @@
+--- slot-retry-fatal/test_retry.py
++++ r3-candidate/test_retry.py
+@@ -597,12 +597,16 @@
+ with Case('t9-schema', [('exc', RESET)] * 3 + [('ok', OK)]) as c:
+     c.run()
+     ev = c.events
+-    check('T9.字段齐全（ts/ts_iso/pid/seq/level/event/detail/run）',
+-          all(set(e) >= {'ts', 'ts_iso', 'pid', 'seq', 'level', 'event', 'detail', 'run'} for e in ev))
++    # [merge R3p4] 契约 v2 §1 强制字段全集（原断言写的是遗留键 ts；见 adapt-test-retry-contract-v2.py）
++    check('T9.字段齐全（契约 v2 §1：schema/ts_epoch/ts_iso/pid/seq/level/event/detail/run）',
++          all(set(e) >= {'schema', 'ts_epoch', 'ts_iso', 'pid', 'seq', 'level', 'event', 'detail', 'run'}
++              for e in ev))
++    check('T9.契约 §1 负判据：v2 行不写遗留键 ts', all('ts' not in e for e in ev))
+     check('T9.level 全为 request', all(e['level'] == 'request' for e in ev))
+     check('T9.seq 严格单调', [e['seq'] for e in ev] == list(range(1, len(ev) + 1)),
+           str([e['seq'] for e in ev]))
+-    check('T9.ts 单调非降', all(ev[i]['ts'] <= ev[i + 1]['ts'] for i in range(len(ev) - 1)))
++    check('T9.ts_epoch 单调非降（契约 v2 权威时间键）',
++          all(ev[i]['ts_epoch'] <= ev[i + 1]['ts_epoch'] for i in range(len(ev) - 1)))
+     check('T9.detail 为对象', all(isinstance(e['detail'], dict) for e in ev))
+     check('T9.run 已标注', all(e['run'] == 'test-t9-schema' for e in ev))
+     check('T9.pid 为本进程', all(e['pid'] == os.getpid() for e in ev))

@@ -1,0 +1,52 @@
+--- a/keeper-v3.sh
++++ b/keeper-v3.sh
+@@ -378,12 +378,14 @@
+ }
+ 
+ # ---------------------------------------------------------------- 审计写入 --
+-# R3 审计 schema 兼容策略（refs/r3-audit-schema.md §兼容性要求）：
+-#   · 既有 v2 事件名/字段一个不改（schema 仍为 keeper-audit/1），只**增**字段
+-#     ts_epoch / level / seq / r3_event / detail ⇒ 老解析器（读 event/from_pid/to_pid/
+-#     evidence）逐行照常可用；v3 解析器按 event 或 r3_event 别名都能取到 R3 事件。
+-#   · 5 个 R3 process 级事件：keeper_restart（restart 的别名）/ keeper_adopt_refused /
+-#     singleton_conflict / heartbeat_stall / graceful_stop —— 只有这 5 个 r3_event 非 null。
++# R3-P4 契约 v2（refs/audit-contract-v2.md §1/§2）—— 行布局与三写者统一：
++#   · 顶层 `schema` 写 "r3-audit-v2"（旧值 keeper-audit/1 降为私有键 keeper_schema 保留）
++#   · `ts`(ISO) → **`ts_iso`**（重命名，契约 §1 遗留键裁决）；`ts_epoch` 保留
++#   · 补 `pid`（= keeper 自身 pid，与 keeper_pid 同值，契约 §1 强制字段）
++#   · 写入侧一律用 canonical 事件名：restart → keeper_restart、adopt → keeper_adopt；
++#     原始事件名降为私有键 `keeper_event` 保留（老解析器仍可读 event/from_pid/to_pid/evidence）
++#   · 其余既有字段（keeper / run_id / run / env / host / ns_mnt / job / level / seq /
++#     evidence / detail / r3_event / r3_schema）一个不删
+ AUDIT_SEQ=0
+ # canonical 事件名（R3p4/refs/audit-contract-v2.md §2）：左=写入名，右=r3_event 别名。
+ # v3.1 新增的进程级事件一律**直接用 canonical 名写入**（identity 映射），便于校验器与
+@@ -409,15 +411,21 @@
+   case "$ex" in ''|-) ex='{}' ;; esac
+   case "$lvl" in request|block|process) : ;; *) lvl=process ;; esac
+   case "$det" in ''|-) det="$ex" ;; esac
+-  local r3 line f
++  local r3 evc line f
+   r3="$(r3_event_of "$evn")"
++  # 写入侧 canonical 名（契约 §2）：r3 别名优先；adopt 是唯一需要额外映射的旧名
++  case "${r3:-$evn}" in
++    adopt) evc=keeper_adopt ;;
++    *)     evc="${r3:-$evn}" ;;
++  esac
+   AUDIT_SEQ=$((AUDIT_SEQ + 1))
+-  # v3.1：**增补**（不改既有键）ts_iso（= ts 的契约 v2 名）与 pid（= keeper_pid 的契约 v2 名），
+-  # 使同一行同时满足 v2 子集解析器与 r3-audit-v2 读侧（行布局权威仍归 audit-unify 槽）。
+-  line="$(printf '{"ts":"%s","ts_iso":"%s","ts_epoch":%s,"schema":"keeper-audit/1","r3_schema":"r3-audit/1","keeper":"%s","run_id":"%s","run":"%s","env":"%s","host":"%s","keeper_pid":%s,"pid":%s,"ns_mnt":"%s","job":"%s","level":"%s","event":"%s","seq":%s,"from_pid":%s,"to_pid":%s,"evidence":%s,"detail":%s,"r3_event":%s}' \
+-    "$(now_iso)" "$(now_iso)" "$(epoch_s)" "$KEEPER_VERSION" "$RUN_ID" "$RUN_ID" "$KEEPER_ENV_TAG" "$HOST_S" "$$" "$$" \
+-    "$(jesc "$NS_MNT")" "$(jesc "$CUR_JOB")" "$lvl" "$(jesc "$evn")" "$AUDIT_SEQ" "$fp" "$tp" "$ex" "$det" \
+-    "$([ -n "$r3" ] && printf '"%s"' "$r3" || printf 'null')")"
++  # [merge R3p4] 行布局裁决：采纳 audit-align-keeper（audit-contract-v2 §1 权威写入侧）。
++  #   契约 §1 明令 v2 行不再写入 `ts` 键 ⇒ 不保留 keeper-match 的 `ts`/`ts_iso` 并列形态；
++  #   keeper-match 侧实质增补（扩展 R3_ALIAS_EVENTS 与 v3.1 全部逻辑）均已保留。
++  line="$(printf '{"schema":"r3-audit-v2","ts_epoch":%s,"ts_iso":"%s","pid":%s,"keeper_schema":"keeper-audit/1","r3_schema":"r3-audit/1","keeper":"%s","run_id":"%s","run":"%s","env":"%s","host":"%s","keeper_pid":%s,"ns_mnt":"%s","job":"%s","level":"%s","event":"%s","seq":%s,"from_pid":%s,"to_pid":%s,"evidence":%s,"detail":%s,"r3_event":%s,"keeper_event":"%s"}' \
++    "$(epoch_s)" "$(now_iso)" "$$" "$KEEPER_VERSION" "$RUN_ID" "$RUN_ID" "$KEEPER_ENV_TAG" "$HOST_S" "$$" \
++    "$(jesc "$NS_MNT")" "$(jesc "$CUR_JOB")" "$lvl" "$(jesc "$evc")" "$AUDIT_SEQ" "$fp" "$tp" "$ex" "$det" \
++    "$([ -n "$evc" ] && printf '"%s"' "$evc" || printf 'null')" "$(jesc "$evn")")"
+   for f in $KEEPER_AUDIT; do
+     mkdir -p "$(dirname "$f")" 2>/dev/null
+     printf '%s\n' "$line" >>"$f" 2>/dev/null || hlog "WARN audit 写入失败: $f"

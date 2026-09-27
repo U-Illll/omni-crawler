@@ -1,0 +1,74 @@
+--- /home/user/go/reasonix-scripts/dsh-wheel/campaigns/lib-crawler-opt/rounds/R3/archive/p4-merge/r3-candidate/scrape.py	2026-09-16 16:46:11.444930355 +0800
++++ /tmp/omni-crawler-src/omni/adapters/library/scrape.py	2026-09-27 12:46:45.142203502 +0800
+@@ -3314,6 +3314,8 @@
+         self.lock = threading.RLock()
+         self.cv = threading.Condition(self.lock)
+         self.inflight = set()
++        # omni-patch(2026-09-27): 认领窗口崩溃快照 —— prefix -> item（落盘见 take/save）
++        self.inflight_items = {}
+         self.deferred_events = 0
+ 
+     def take(self):
+@@ -3325,12 +3327,19 @@
+                     continue
+                 self.todo.pop(i)
+                 self.inflight.add(p)
++                # omni-patch: 认领即写 inflight 快照并落盘 —— 进程在"条目处理中"任何
++                # 时刻被杀（kill -9/断电），重启时凭快照回队，杜绝"条目无痕丢失→假收敛"。
++                self.inflight_items[p] = it
++                self.prog['_inflight_snapshot'] = [dict(x) for x in self.inflight_items.values()]
++                save_progress(self.prog)
+                 return it
+             return None
+ 
+     def finish(self, item):
+         with self.cv:
+             self.inflight.discard(item.get('p'))
++            self.inflight_items.pop(item.get('p'), None)
++            self.prog['_inflight_snapshot'] = [dict(x) for x in self.inflight_items.values()]
+             self.cv.notify_all()
+ 
+     def put_tail(self, item, delay=0.0):
+@@ -3349,8 +3358,10 @@
+             self.cv.notify_all()
+ 
+     def save(self, ctx=None):
+-        """持锁保存 ⇒ json.dumps 序列化到的是完整快照（I4）。RLock 可重入。"""
++        """持锁保存 ⇒ json.dumps 序列化到的是完整快照（I4）。RLock 可重入。
++        omni-patch: 保存前同步 inflight 快照字段。"""
+         with self.lock:
++            self.prog['_inflight_snapshot'] = [dict(x) for x in self.inflight_items.values()]
+             save_progress(self.prog, ctx)
+ 
+     def idle(self):
+@@ -4058,6 +4069,30 @@
+             _g.setdefault('repair_attempts', 0)
+         prog.setdefault('seeds', list(args) if args else list(string.ascii_uppercase))
+ 
++    # omni-patch(2026-09-27): inflight 快照回队 —— 崩溃窗口 = 条目被认领处理中
++    # （缺此恢复：条目 take 后从磁盘 todo 移除、被杀即无痕丢失 → 重启假收敛 exit 0）
++    _snap = prog.pop('_inflight_snapshot', None) or []
++    if _snap:
++        _todo_ps = {x.get('p') for x in (prog.get('todo') or [])}
++        _done_ps = set()
++        for _d in (prog.get('done') or []):
++            _done_ps.add(_d.get('p') if isinstance(_d, dict) else _d)
++        _requeue = []
++        for _it in _snap:
++            _p = (_it or {}).get('p') if isinstance(_it, dict) else None
++            if _p and _p not in _todo_ps and _p not in _done_ps:
++                _requeue.append(_it)
++                _todo_ps.add(_p)
++        if _requeue:
++            prog['todo'] = list(_requeue) + (prog.get('todo') or [])
++            log(f"[omni] inflight 快照回队 {len(_requeue)} 项: "
++                f"{[x.get('p') for x in _requeue]}")
++            try:
++                audit_event('inflight_requeue', 'process',
++                            {'count': len(_requeue),
++                             'items': [x.get('p') for x in _requeue]})
++            except Exception:
++                pass
+     reconcile(prog)                                     # v10: 启动先做一致性自愈
+     save_progress(prog)
+     log(f"=== scrape v10 长程加固版启动（MIN_INTERVAL={MIN_INTERVAL} PROBE_WORKERS={PROBE_WORKERS}）===")

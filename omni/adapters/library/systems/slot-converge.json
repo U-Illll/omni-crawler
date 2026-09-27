@@ -1,0 +1,13 @@
+{
+  "name": "slot-converge",
+  "label": "R3 slot-converge：块级兜底/收敛判据（C2/F1/F5/F6）候选 scrape.py + 基线 keeper",
+  "scrape": "/tmp/lib-opt-work/R3/impl/slot-converge/scrape.py",
+  "memguard": "/tmp/lib-opt-work/R3/refs/memguard.py",
+  "heartbeat": "/tmp/lib-opt-work/R3/refs/heartbeat.py",
+  "keeper": "/tmp/lib-opt-work/R3/refs/keeper-v2.sh",
+  "strict": ["scrape"],
+  "job_name": "v8",
+  "complete_marker": "全部完成",
+  "keeper_tick": 5,
+  "recovery_deadline": 180
+}

@@ -1,0 +1,14 @@
+{
+  "name": "slot-keeper3",
+  "label": "R3 slot-keeper3：进程级看护 v3（C3）候选 keeper + 基线 scrape",
+  "scrape": "/tmp/lib-opt-work/R3/refs/scrape-r2cand.py",
+  "memguard": "/tmp/lib-opt-work/R3/refs/memguard.py",
+  "heartbeat": "/tmp/lib-opt-work/R3/refs/heartbeat.py",
+  "keeper": "/tmp/lib-opt-work/R3/impl/slot-keeper3/keeper-v3.sh",
+  "fallbacks": {"keeper": "/tmp/lib-opt-work/R3/refs/keeper-v2.sh"},
+  "strict": ["scrape"],
+  "job_name": "v8",
+  "complete_marker": "全部完成",
+  "keeper_tick": 5,
+  "recovery_deadline": 180
+}

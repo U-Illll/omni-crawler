@@ -1,0 +1,1324 @@
+--- a/scrape.py
++++ b/scrape.py
+@@ -1763,9 +1763,19 @@
+ RETRY_ENFORCE_MIN = _env_num('SCRAPE_RETRY_ENFORCE_MIN', 1, int) == 1   # v2 下补齐 C1 下限
+ RETRY_MAX_ATTEMPTS = _env_num('SCRAPE_RETRY_MAX_ATTEMPTS', 12, int)     # 尝试次数**硬上限**（不可被下限突破）
+ # R-2：抖动形式由「乘性 U(0.75,1.25)」改为 **equal jitter**（见 _retry_wait_plan）。
+-# 这两个常量保留为**历史读数口径**（旧报告/对照脚本引用），不再参与退避计算。
+-RETRY_JITTER_LO = 0.75                        # 【弃用】旧乘性抖动下界（保留仅为兼容引用）
+-RETRY_JITTER_HI = 1.25                        # 【弃用】旧乘性抖动上界（保留仅为兼容引用）
++# R-8（P4.5·v2.1）：**旧的 RETRY_JITTER_LO/HI 已删除**。它们是"乘性抖动"的口径
++#   （wait = d × U(0.75,1.25)，E[wait] = 1.00·d），与本实现不符；保留导出会让读者
++#   （验收探针 / 报告读者）拿到错误口径：例如按 [0.75,1.25]×d 判"样本是否越界"会把
++#   equal jitter 合法落在 [0.5·d, 0.75·d) 的样本误判为越界。
++#   现行口径（唯一权威：`_retry_wait_band` / `_retry_wait_plan`）：
++#     d = min(cap, base·factor^att)；wait = d/2 + U(0, d/2)
++#     ⇒ wait/d ∈ [RETRY_JITTER_BAND]，E[wait] = RETRY_JITTER_MEAN·d = 0.75·d。
++#   与乘性基线相比：期望等待**收紧 25%**（1.00·d → 0.75·d），上界由 1.25·d 降到 1.00·d
++#   （更保守）；这是 retry-fatal 的**已知取舍**（抖动不再可能超过 d，cap 语义更干净），
++#   代价是同一档位的等待分布整体左移（对限流场景是更激进的试探，故保留 cap 与全局
++#   cooldown 归属不变）。读数对账请用 RETRY_JITTER_BAND/MEAN 或直接调 `_retry_wait_band`。
++RETRY_JITTER_BAND = (0.5, 1.0)                # wait/d 的取值带（equal jitter 下界、上界）
++RETRY_JITTER_MEAN = 0.75                      # E[wait]/d（= 带的均值；读数对账用）
+ # 每类错误的指数退避参数：class -> (base_s, factor, cap_s)
+ #   d = min(cap, base × factor^att)；wait = d/2 + U(0, d/2)（equal jitter）
+ RETRY_BACKOFF = {
+@@ -1943,6 +1953,9 @@
+     """退避档位的 (lo, hi)：equal jitter 下 wait ∈ [d/2, d]，d = min(cap, base·factor^att)。
+ 
+     这是 _retry_wait_plan 的**解析上界**，供单测断言 R-B2 的两条性质（cap / 首档 / 单调）。
++    R-8（v2.1）：本函数与 `RETRY_JITTER_BAND`/`RETRY_JITTER_MEAN` 是抖动口径的**唯一权威**；
++    旧的 `RETRY_JITTER_LO/HI`（乘性口径）已删除，不得再按 [0.75,1.25]×d 判越界。
++    返回的 (lo, hi) 与 RETRY_JITTER_BAND 的关系：lo = BAND[0]·d，hi = BAND[1]·d。
+     """
+     base, factor, cap = RETRY_BACKOFF.get(cls, RETRY_BACKOFF['other'])
+     d = float(base) * (float(factor) ** int(att))
+@@ -2336,6 +2349,14 @@
+ # ===========================================================================
+ 
+ R3_AUDIT_SCHEMA = 'r3-audit-v2'    # R3-P4 契约 v2 §1：三写者统一 schema 值（原 r3-audit-v1）
++# R3-P4·P4.5 契约 v2.1 §8.1（KI-1 修复）：**写者分组键**。
++#   本进程内有两个审计写者共用同一 pid 与同一 OUT/audit.jsonl：
++#     ① 本文件的块级写者 audit_event()（_AUDIT_SEQ，本常量 = "converge"）；
++#     ② 请求级写者 audit.py（经 _retry_audit 懒加载，其 _ST['seq']，writer = "retry"）。
++#   二者的 seq 计数器互相独立 ⇒ 只按 pid 分组会让合流文件出现 seq_duplicate
++#   （p4-verify 在真实 S4 上复现：pid=8631 seq=1/2/3 重复）。故每行都写 writer，
++#   校验器按 (文件, pid, writer) 分组（契约 §8.2/§8.4）。
++R3_AUDIT_WRITER = 'converge'       # 契约 v2.1 §8.1：块级（converge 侧）写者身份
+ EXIT_CONVERGED = 0
+ EXIT_INCOMPLETE = int(_env_num('SCRAPE_INCOMPLETE_EXIT', 3, int))   # 未收敛退出码（可配 0 兼容旧 keeper）
+ EXIT_STALL_STOP = int(_env_num('SCRAPE_STALL_EXIT', 4, int))
+@@ -2428,7 +2449,10 @@
+     """写一行结构化自愈审计事件（C3：每级自愈事件都必须有结构化记录）。
+ 
+     永不抛异常、永不阻塞数据面：审计是**观测面**，任何失败都只能降级为计数丢失
+-    （审计自身写失败 → 尝试重建 output 目录重写一次 → 仍失败则丢弃该事件并计数）。"""
++    （审计自身写失败 → 尝试重建 output 目录重写一次 → 仍失败则丢弃该事件并计数）。
++
++    契约 v2.1 §8.1：本行带 `writer=R3_AUDIT_WRITER`（"converge"）——本函数的 `_AUDIT_SEQ`
++    与 audit.py（"retry"）的 seq 是两个独立计数器，校验器按 (文件, pid, writer) 分组。"""
+     global _AUDIT_SEQ, _AUDIT_DROPPED
+     try:
+         with _AUDIT_LOCK:
+@@ -2436,7 +2460,7 @@
+             ev = {'schema': R3_AUDIT_SCHEMA,
+                   'ts_epoch': round(time.time(), 3),      # 契约 v2：权威时间键
+                   'ts_iso': datetime.now().isoformat(timespec='milliseconds'),
+-                  'pid': os.getpid(), 'seq': _AUDIT_SEQ,
++                  'pid': os.getpid(), 'writer': R3_AUDIT_WRITER, 'seq': _AUDIT_SEQ,
+                   'level': level, 'event': event, 'run': run or _r3_run_id(),
+                   'detail': detail if isinstance(detail, dict) else {'value': detail}}
+             blob = (json.dumps(ev, ensure_ascii=False) + '\n').encode('utf-8')
+--- a/audit.py
++++ b/audit.py
+@@ -9,13 +9,26 @@
+ **request 级**事件（`retry_scheduled` / `retry_exhausted` / `error_classified`），
+ 但接口对三级通用，供其它槽复用（可加字段，不破坏既有解析）。
+ 
+-字段（契约 v2 §1，三写者统一布局）
+----------------------------------
++字段（契约 v2 §1 + v2.1 §8，三写者统一布局）
++------------------------------------------
+ `schema`("r3-audit-v2") `ts_epoch`(epoch float，**权威时间**) `ts_iso`(ISO 字符串)
+-`pid`(int) `seq`(进程内从 1 严格 +1) `level`("request"|"block"|"process") `event`(事件名)
+-`detail`(对象) `run`(可选)
++`pid`(int) **`writer`**(string，写者身份) `seq`(**写者内**从 1 严格 +1)
++`level`("request"|"block"|"process") `event`(事件名) `detail`(对象) `run`(可选)
+ 遗留键 `ts` **不再写入**（契约 §1 裁决：历史 ts 三侧语义不一）。
+ 
++writer 分组键（契约 v2.1 §8，KI-1 修复）
++--------------------------------------
++同一个进程内可以有**多个写者**（`scrape.py` 的块级 `audit_event()` 与经本模块的请求级
++写者共用同一个 `pid` 与同一个 `OUT/audit.jsonl`），二者各有独立计数器 ⇒ 只按 `pid`
++分组会出现 `seq_duplicate`（P4-verify 在真实 S4 上复现）。故 v2.1 引入 `writer`：
++
++· 本模块（请求级/retry 侧）写 `writer="retry"`（默认值 `WRITER`，可用
++  `SCRAPE_AUDIT_WRITER` 或 `init(writer=...)` 覆盖，供其它写者复用本模块）。
++· `scrape.py` 的块级审计段写 `writer="converge"`；`keeper-v3.sh` 写 `writer="keeper"`。
++· 校验器按 `(文件, pid, writer)` 分组 ⇒ 同 pid 双写者合流时各组独立连续（契约 §8.2/§8.4）。
++· **新写入一律带 writer**（契约 §8.5）；v2.0 历史产物（无 writer）只能用
++  `audit-verify-v2.py --compat-v1` 对照读取。
++
+ R3-P4 修复（crit-correct R-7 / M4）
+ ----------------------------------
+ · **F3 inode 存活校验**：`_ensure_fd()` 每次写前用 `st_nlink + (dev,ino)` 核对 fd 指向的
+@@ -54,7 +67,7 @@
+ import time
+ from datetime import datetime
+ 
+-__all__ = ['LEVELS', 'init', 'emit', 'emit_request', 'emit_block', 'emit_process',
++__all__ = ['LEVELS', 'WRITER', 'init', 'emit', 'emit_request', 'emit_block', 'emit_process',
+            'path', 'is_enabled', 'stats', 'close', 'reset', 'DEFAULT_NAME']
+ 
+ SCHEMA = 'r3-audit-v2'          # 契约 v2 §1：三写者统一 schema 值
+@@ -63,6 +76,8 @@
+ ENV_OUT_DIR = 'SCRAPE_OUT_DIR'
+ ENV_ROTATE_MB = 'SCRAPE_AUDIT_ROTATE_MB'
+ DEFAULT_NAME = 'audit.jsonl'
++WRITER = 'retry'               # 契约 v2.1 §8.1：本模块 = 请求级（retry 侧）写者身份
++ENV_WRITER = 'SCRAPE_AUDIT_WRITER'
+ DISABLE_TOKENS = ('0', 'off', 'false', 'no', 'none', 'disable', 'disabled', 'null')
+ MAX_LINE_BYTES = 8192          # 单行上限（超出 ⇒ detail 截断为 raw 字符串）
+ DETAIL_MAX_CHARS = 4000
+@@ -71,7 +86,8 @@
+ _ST = {
+     'path': None,          # 当前审计文件路径（str）或 None（未初始化/禁用）
+     'fd': None,            # 已打开的 O_APPEND fd
+-    'seq': 0,              # 进程内单调事件序号（含写失败的那些，保证严格递增）
++    'seq': 0,              # **写者内**单调事件序号（含写失败的那些，保证严格递增）
++    'writer': WRITER,      # 契约 v2.1 §8.1：写者分组键（默认 retry 侧）
+     'written': 0,          # 成功落盘行数
+     'errors': 0,           # 写失败次数（审计自身故障，不影响主流程）
+     'last_error': None,
+@@ -142,16 +158,31 @@
+     return int(mb * 1024 * 1024)
+ 
+ 
+-def init(path=None, run=None, enabled=None, rotate_bytes=None, reset_seq=False):
++def _writer_from_env():
++    """写者身份（契约 v2.1 §8.1）：`SCRAPE_AUDIT_WRITER` 非空 ⇒ 用它，否则默认 `WRITER`。"""
++    raw = (os.environ.get(ENV_WRITER) or '').strip()
++    return raw or WRITER
++
++
++def writer():
++    """当前生效的写者身份（写入每行的 `writer` 字段）。"""
++    return _ST['writer']
++
++
++def init(path=None, run=None, enabled=None, rotate_bytes=None, reset_seq=False, writer=None):
+     """初始化/改绑审计出口。返回生效路径（禁用/无路径 ⇒ None）。**绝不抛异常**。
+ 
+     path: 审计文件路径；None ⇒ default_path()。传空串 '' ⇒ 显式禁用。
+     enabled: 强制开关；None ⇒ 由 SCRAPE_AUDIT 决定。
+     reset_seq: 归零 seq（仅测试用，保证每个用例的 seq 断言独立）。
++    writer: 写者身份（契约 v2.1 §8.1）；None ⇒ `SCRAPE_AUDIT_WRITER` > 默认 `"retry"`。
++            **恒不为空**（空串/纯空白 ⇒ 回落默认值）——契约 §8.5 要求新写入必带 writer。
+     """
+     try:
+         with _LOCK:
+             new_path = default_path() if path is None else str(path)
++            _ST['writer'] = (str(writer).strip() if writer is not None else '') \
++                or _writer_from_env()
+             if reset_seq:
+                 _ST['seq'] = 0
+                 _ST['written'] = 0
+@@ -220,6 +251,7 @@
+         _ST.update({'path': None, 'seq': 0, 'written': 0, 'errors': 0, 'bytes': 0,
+                     'rotations': 0, 'by_event': {}, 'by_level': {}, 'calls': 0,
+                     'last_error': None, 'enabled': True, 'last_ts': None, 'init_n': 0,
++                    'writer': WRITER,
+                     'dropped': 0, 'fd_reopens': 0, 'heals': 0,
+                     'rotate_skipped_shared': 0, 'external_writes_seen': 0})
+ 
+@@ -367,7 +399,8 @@
+             if fields:
+                 d.update(fields)
+             rec = {'schema': SCHEMA, 'ts_epoch': round(float(ts), 6), 'ts_iso': _iso(ts),
+-                   'pid': os.getpid(), 'seq': _ST['seq'], 'level': level, 'event': event,
++                   'pid': os.getpid(), 'writer': _ST['writer'] or WRITER,
++                   'seq': _ST['seq'], 'level': level, 'event': event,
+                    'detail': d, 'run': run if run is not None else _ST['run']}
+             try:
+                 line = json.dumps(rec, ensure_ascii=False, sort_keys=False, default=str) + '\n'
+@@ -443,10 +476,15 @@
+     with open(p, encoding='utf-8') as f:
+         recs = [json.loads(l) for l in f if l.strip()]
+     chk('lines', len(recs) == 4, 'n=%d' % len(recs))
+-    chk('schema.keys', all(set(r) >= {'schema', 'ts_epoch', 'ts_iso', 'pid', 'seq', 'level',
+-                                      'event', 'detail', 'run'} for r in recs))
++    chk('schema.keys', all(set(r) >= {'schema', 'ts_epoch', 'ts_iso', 'pid', 'writer', 'seq',
++                                      'level', 'event', 'detail', 'run'} for r in recs))
+     chk('schema.value', all(r['schema'] == 'r3-audit-v2' for r in recs))
+     chk('no_legacy_ts', all('ts' not in r for r in recs))
++    # 契约 v2.1 §8.1/§8.5：新写入必须带 writer，且本模块默认写 "retry"
++    chk('writer.default_retry', all(r.get('writer') == 'retry' for r in recs)
++        and WRITER == 'retry', str({r.get('writer') for r in recs}))
++    chk('writer.nonempty_str', all(isinstance(r.get('writer'), str) and r['writer'].strip()
++                                   for r in recs))
+     chk('seq.monotonic', [r['seq'] for r in recs] == [1, 2, 3, 4])
+     chk('level.enum', all(r['level'] in LEVELS for r in recs))
+     chk('detail.obj', all(isinstance(r['detail'], dict) for r in recs))
+@@ -456,6 +494,30 @@
+     st = stats()
+     chk('stats.written', st['written'] == 4 and st['errors'] == 0, str(st['by_event']))
+ 
++    # writer 覆盖语义（契约 v2.1 §8.1：其它写者可复用本模块，身份必须可显式指定）
++    close()
++    reset()
++    init(path=p, run='w2', reset_seq=True, writer='keeper')
++    emit_request('keeper_exit')
++    rec_w = [json.loads(l) for l in open(p, encoding='utf-8') if l.strip()]
++    chk('writer.explicit_override', rec_w and rec_w[-1].get('writer') == 'keeper'
++        and writer() == 'keeper', str(rec_w[-1].get('writer') if rec_w else None))
++    reset()
++    init(path=p, run='w3', reset_seq=True, writer='   ')
++    emit_request('keeper_exit')
++    rec_w = [json.loads(l) for l in open(p, encoding='utf-8') if l.strip()]
++    chk('writer.blank_falls_back', rec_w and rec_w[-1].get('writer') == WRITER,
++        str(rec_w[-1].get('writer') if rec_w else None))
++    os.environ[ENV_WRITER] = 'envwriter'
++    reset()
++    init(path=p, run='w4', reset_seq=True)
++    emit_request('keeper_exit')
++    rec_w = [json.loads(l) for l in open(p, encoding='utf-8') if l.strip()]
++    chk('writer.env_override', rec_w and rec_w[-1].get('writer') == 'envwriter',
++        str(rec_w[-1].get('writer') if rec_w else None))
++    os.environ.pop(ENV_WRITER, None)
++    reset()
++
+     # 禁用语义
+     close()
+     reset()
+@@ -511,8 +573,8 @@
+     n_before = stats()['written']
+     with open(p3, 'a', encoding='utf-8') as f:     # 外部写者插一行
+         f.write(json.dumps({'schema': 'r3-audit-v2', 'ts_epoch': time.time(),
+-                            'ts_iso': _iso(time.time()), 'pid': 999999, 'seq': 1,
+-                            'level': 'process', 'event': 'keeper_start',
++                            'ts_iso': _iso(time.time()), 'pid': 999999, 'writer': 'keeper',
++                            'seq': 1, 'level': 'process', 'event': 'keeper_start',
+                             'detail': {}}) + '\n')
+     for i in range(3):                             # 阶段2：共享 sink
+         emit_request('retry_scheduled', {'attempt': 10 + i, 'pad': 'y' * 40})
+@@ -527,6 +589,43 @@
+         'phase2 rows=%d（阶段1 已轮转 %d 次，written=%d→%d）'
+         % (len(mine_phase2), rot_before, n_before, st['written']))
+     chk('rotate.peer_row_kept', any(r.get('pid') == 999999 for r in rows))
++    chk('rotate.every_row_has_writer', all(r.get('writer') for r in rows),
++        str(sorted({r.get('writer') for r in rows})))
++    reset()
++
++    # ---- 契约 v2.1 §8.4（KI-1 的模块内回归护栏）：同 pid 双写者合流 ----
++    # 模拟 scrape.py 的块级写者（converge）与请求级写者（本模块 retry）共用同一进程 + 同一
++    # sink：两个计数器各写 1..n ⇒ 按 (pid, writer) 分组必须各自从 1 连续；按 pid 单键分组
++    # 必然出现重复号（这正是 P4-verify 在真实 S4 上复现的 KI-1 现象）。
++    reset()
++    d4 = os.path.join(tmp, 'dualwriter')
++    os.makedirs(d4, exist_ok=True)
++    p4 = os.path.join(d4, 'audit.jsonl')
++    init(path=p4, run='dual', reset_seq=True)          # writer == WRITER == 'retry'
++    for i in range(3):
++        emit_request('retry_scheduled', {'attempt': i})
++    twin_pid = os.getpid()
++    with open(p4, 'a', encoding='utf-8') as f:         # 同 pid 的第二写者
++        for i in (1, 2, 3, 4):
++            f.write(json.dumps({'schema': 'r3-audit-v2', 'ts_epoch': time.time() + i,
++                                'ts_iso': _iso(time.time() + i), 'pid': twin_pid,
++                                'writer': 'converge', 'seq': i, 'level': 'block',
++                                'event': 'run_start', 'detail': {}}) + '\n')
++    rows4 = [json.loads(l) for l in open(p4, encoding='utf-8') if l.strip()]
++    by_pid, by_pidw = {}, {}
++    for r in rows4:
++        by_pid.setdefault(r['pid'], []).append(r['seq'])
++        by_pidw.setdefault((r['pid'], r.get('writer')), []).append(r['seq'])
++    groups = {k[1]: sorted(v) for k, v in by_pidw.items()}
++    chk('writer.dual_same_pid_groups_continuous',
++        set(groups) == {WRITER, 'converge'}
++        and all(v == list(range(1, len(v) + 1)) for v in groups.values()),
++        '按 (pid,writer) 分组：%s' % json.dumps(groups, sort_keys=True))
++    pid_only = sorted(by_pid.get(twin_pid) or [])
++    chk('writer.pid_only_group_would_dup',
++        len(pid_only) != len(set(pid_only)),
++        '按 pid 单键分组 seq=%s ⇒ 重复 %d 个（KI-1 签名）'
++        % (pid_only, len(pid_only) - len(set(pid_only))))
+     reset()
+     print('audit.py selftest: %d pass / %d fail' % (ok, bad))
+     return 0 if bad == 0 else 1
+--- a/keeper-v3.sh
++++ b/keeper-v3.sh
+@@ -384,9 +384,14 @@
+ #   · 补 `pid`（= keeper 自身 pid，与 keeper_pid 同值，契约 §1 强制字段）
+ #   · 写入侧一律用 canonical 事件名：restart → keeper_restart、adopt → keeper_adopt；
+ #     原始事件名降为私有键 `keeper_event` 保留（老解析器仍可读 event/from_pid/to_pid/evidence）
++#   · 契约 v2.1 §8.1（KI-1 修复）：补 **`writer`** 分组键 = "keeper"（本文件是 keeper 侧
++#     写者；scrape 侧写 converge/retry）。校验器按 (文件, pid, writer) 分组 ⇒ 同一 sink 上
++#     多个写者各持独立 seq 时不会误判为 seq_duplicate。
+ #   · 其余既有字段（keeper / run_id / run / env / host / ns_mnt / job / level / seq /
+ #     evidence / detail / r3_event / r3_schema）一个不删
+ AUDIT_SEQ=0
++# 契约 v2.1 §8.1：本写者身份（写入每行的 writer 字段）
++AUDIT_WRITER="keeper"
+ # canonical 事件名（R3p4/refs/audit-contract-v2.md §2）：左=写入名，右=r3_event 别名。
+ # v3.1 新增的进程级事件一律**直接用 canonical 名写入**（identity 映射），便于校验器与
+ # 合并槽按统一口径识别；旧事件（restart 等）保持写入名不变 + 别名映射（子集兼容）。
+@@ -422,8 +427,9 @@
+   # [merge R3p4] 行布局裁决：采纳 audit-align-keeper（audit-contract-v2 §1 权威写入侧）。
+   #   契约 §1 明令 v2 行不再写入 `ts` 键 ⇒ 不保留 keeper-match 的 `ts`/`ts_iso` 并列形态；
+   #   keeper-match 侧实质增补（扩展 R3_ALIAS_EVENTS 与 v3.1 全部逻辑）均已保留。
+-  line="$(printf '{"schema":"r3-audit-v2","ts_epoch":%s,"ts_iso":"%s","pid":%s,"keeper_schema":"keeper-audit/1","r3_schema":"r3-audit/1","keeper":"%s","run_id":"%s","run":"%s","env":"%s","host":"%s","keeper_pid":%s,"ns_mnt":"%s","job":"%s","level":"%s","event":"%s","seq":%s,"from_pid":%s,"to_pid":%s,"evidence":%s,"detail":%s,"r3_event":%s,"keeper_event":"%s"}' \
+-    "$(epoch_s)" "$(now_iso)" "$$" "$KEEPER_VERSION" "$RUN_ID" "$RUN_ID" "$KEEPER_ENV_TAG" "$HOST_S" "$$" \
++  # [P4.5 v2.1] 契约 §8.1：`writer` 为**字面量** "keeper"（无占位符 ⇒ printf 参数表不变）。
++  line="$(printf '{"schema":"r3-audit-v2","ts_epoch":%s,"ts_iso":"%s","pid":%s,"writer":"%s","keeper_schema":"keeper-audit/1","r3_schema":"r3-audit/1","keeper":"%s","run_id":"%s","run":"%s","env":"%s","host":"%s","keeper_pid":%s,"ns_mnt":"%s","job":"%s","level":"%s","event":"%s","seq":%s,"from_pid":%s,"to_pid":%s,"evidence":%s,"detail":%s,"r3_event":%s,"keeper_event":"%s"}' \
++    "$(epoch_s)" "$(now_iso)" "$$" "$AUDIT_WRITER" "$KEEPER_VERSION" "$RUN_ID" "$RUN_ID" "$KEEPER_ENV_TAG" "$HOST_S" "$$" \
+     "$(jesc "$NS_MNT")" "$(jesc "$CUR_JOB")" "$lvl" "$(jesc "$evc")" "$AUDIT_SEQ" "$fp" "$tp" "$ex" "$det" \
+     "$([ -n "$evc" ] && printf '"%s"' "$evc" || printf 'null')" "$(jesc "$evn")")"
+   for f in $KEEPER_AUDIT; do
+--- a/audit-verify-v2.py
++++ b/audit-verify-v2.py
+@@ -1,8 +1,9 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-"""audit-verify-v2.py —— R3-P4 统一审计校验器 v2（防伪 + 三写者统一布局）
++"""audit-verify-v2.py —— R3-P4 统一审计校验器 v2.1（防伪 + 三写者统一布局 + writer 分组）
+ 
+-权威契约：`R3p4/refs/audit-contract-v2.md`（冻结稿）。本文件是该契约 §5/§6/§7 的实现。
++权威契约：`R3p4/refs/audit-contract-v2.md`（冻结稿 §1–§7，**§8 = v2.1 增量**）。
++本文件是该契约 §5/§6/§7/§8 的实现。自我版本：`VERIFIER_VERSION`。
+ 
+ 与 v1（`R3/impl/slot-drill/audit-verify.py`）的关系
+ --------------------------------------------------
+@@ -18,14 +19,20 @@
+           + `canonical_pass=False`（降级可见，绝不静默通过）。
+   3. **血缘（anti-fabrication）**：evidence.json + 真实过程证据（records.jsonl/scrape.log）
+      + pid 与真实产物可关联 + 审计文件不得在 run 窗口结束后被追加。全手写文件 ⇒ FAIL。
+-  4. **seq 防伪**：同一文件内**按 pid 分组**，组内 seq 必须从 1 起严格 +1（缺号/乱序/0 起
+-     ⇒ 硬违规）。堵 e5「换 pid 插入乱序事件」。
++  4. **seq 防伪（v2.1 修订）**：同一文件内按 **(pid, writer)** 分组，组内 seq 必须从 1 起
++     严格 +1（缺号/乱序/0 起 ⇒ 硬违规）。堵 e5「换 pid 插入乱序事件」。
++     v2.0 只按 pid 分组，隐含假设"一个 pid = 一个写者"；KI-1（p4-verify 在真实 S4 上复现的
++     `seq_duplicate pid=8631 seq=1/2/3`）证明该假设不成立：同一进程内 `scrape.py` 的块级
++     写者与 `audit.py` 的请求级写者各持**独立**计数器 ⇒ 必须引入 `writer` 分组键（契约 §8）。
+   5. **derived 通道收紧**：来源须在场景目录内 + mtime 在 run 窗口内 + 内容含具体读数
+      （含数字，纯模板句不算）；derived-only ⇒ `channel=derived` + `evidence_level=low`。
+   6. **撕裂行**：仅**末行**撕裂容忍 1 条（warning）；其余坏行硬违规（对齐 e3）。
+   7. **退出码分级**：0=全过 / 1=硬违规或链路断言不过 / 2=用法或环境错误。
+-  8. **`--compat-v1`**：读旧布局（`r3-audit-v1` / keeper-v2）做对照，只给 warning 不判死；
+-     默认（严格）模式下旧布局行是硬违规 `legacy_layout:*`（契约 §1「新写入一律 v2」）。
++  8. **`--compat-v1`**：读旧布局（`r3-audit-v1` / keeper-v2 / **v2.0 无 writer 行**）做对照，
++     只给 warning 不判死；默认（严格）模式下旧布局行是硬违规 `legacy_layout:*`，
++     且 **v2 行缺 `writer` 是硬违规 `writer_missing`**（契约 §8.2/§8.5：新写入必带 writer）。
++     compat 模式下缺 writer 的行回退按 `(pid, "")` 分组（契约 §8.2），其 seq 偏差一并降级为
++     warning 并登记 `compat_v1_seq_grouping_by_pid` 降级原因 —— 否则"历史对照"永远 exit 1。
+ 
+ 用法
+ ----
+@@ -50,7 +57,10 @@
+ sys.path.insert(0, str(HERE))
+ 
+ SCHEMA_V2 = "r3-audit-v2"
++VERIFIER_VERSION = "2.1"                  # v2.1 = 契约 §8（writer 分组键 + keeper 事件表对齐）
++CONTRACT_REV = "v2.1"                     # 实现的契约修订版（§1–§7 + §8）
+ LEVELS = ("request", "block", "process")
++WRITER_KEYS = ("retry", "converge", "keeper")   # 契约 §8.1 的具名写者（其它短横线名合法）
+ TS_MIN = 1735689600.0                     # 2026-01-01T00:00:00Z
+ TS_FUTURE_TOL = 600.0
+ PRE_SLACK_S = 10.0                        # 注入线前松弛（窗口下界）
+@@ -97,6 +107,21 @@
+                    "config_rail_override", "config_rail_refused", "config_warning",
+                    "selftest_case", "selftest_result", "run_start", "run_end", "graceful_stop",
+                    "stall_detected", "dir_recreate"])
++# ---------------------------------------------------------------------------
++# R-9 修复（P4.5·v2.1）：keeper 侧 `R3_ALIAS_EVENTS` 的 canonical 名必须与本校验器**同一张表**。
++# 病灶：keeper-v3.sh 的别名表把这些名字当 canonical 直接写入 `event`，而本表缺项 ⇒ 校验器把
++# 真实 S4 的 `keeper_exit_observed` 记成 `event_unknown` warning（"两侧事件表不对齐"）。
++# 裁决（侵入小者）：**改读侧表**（keeper 侧写入名不动）——keeper 的别名表是 wire 兼容映射，
++# 改它要动 keeper 的写入路径与历史语义；扩展本表只影响"名字是否被认识"。
++# 名单来源（机器核对，非手抄）：`grep '^audit <name>' keeper-v3.sh` ∪ `R3_ALIAS_EVENTS`
++# 左端，去掉经 `r3_event_of` 已映射到 canonical 的旧名（如 restart→keeper_restart）。
++# 回归护栏：`--self-test` 的 `keeper.event_table_aligned` 直接从 keeper-v3.sh 重新提取并断言。
++# ---------------------------------------------------------------------------
++_reg({"process"}, ["keeper_exit_observed", "keeper_lock_unavailable", "keeper_lock_rotated",
++                   "keeper_job_stop", "keeper_job_halt", "keeper_job_resume",
++                   "keeper_terminal_report_stale", "keeper_terminal_channel_conflict",
++                   "keeper_restart_budget", "keeper_restart_budget_exhausted",
++                   "spawn_refused"])
+ 
+ # 旧名 → canonical（契约 §2「读侧映射」，**单向**，避免 v1 的反向映射陷阱 L7）
+ ALIASES_V1 = {
+@@ -308,7 +333,7 @@
+ # 记录装载 + v2 行布局校验
+ # ===========================================================================
+ def _v2_line_errors(d, allow_legacy_ts=False, strict_unknown=False):
+-    """v2 行布局校验（契约 §1）。返回 (issues, rec_fields)。"""
++    """v2 行布局校验（契约 §1 + §8）。返回 (issues, rec_fields)。"""
+     iss = []
+     sch = d.get("schema")
+     if sch != SCHEMA_V2:
+@@ -342,6 +367,16 @@
+     if not isinstance(pid, int) or isinstance(pid, bool):
+         iss.append(("pid_missing_or_not_int", "pid=%r" % (pid,)))
+         pid = None
++    # 契约 §8.1/§8.2（v2.1）：`writer` 是**强制字段**（写者分组键）。
++    #   严格模式：缺失/空/非字符串 ⇒ 硬违规 `writer_missing`（§8.2/§8.5 新写入必带 writer）。
++    #   compat 模式：调用方把该 kind 降级为 warning，并按 (pid, "") 回退分组（§8.2）。
++    w = d.get("writer")
++    if not isinstance(w, str) or not w.strip():
++        iss.append(("writer_missing", "writer=%r（契约 v2.1 §8.1：v2 行必须写 writer 分组键；"
++                                      "§8.5 新写入一律带 writer）" % (w,)))
++        w = ""
++    else:
++        w = w.strip()
+     seq = d.get("seq")
+     if not isinstance(seq, int) or isinstance(seq, bool):
+         iss.append(("seq_missing_or_not_int", "seq=%r" % (seq,)))
+@@ -369,7 +404,7 @@
+     elif not isinstance(det, dict):
+         iss.append(("detail_not_object", "type=%s" % type(det).__name__))
+         det = {"_value": det}
+-    rec = {"layout": "v2", "ts": tse, "ts_iso": tsi, "pid": pid, "seq": seq,
++    rec = {"layout": "v2", "ts": tse, "ts_iso": tsi, "pid": pid, "writer": w, "seq": seq,
+            "level": lvl, "event": ev, "detail": det,
+            "run": d.get("run") or d.get("run_id"), "r3_fields": True,
+            "canonical_event": ev, "raw_event": d.get("event")}
+@@ -409,6 +444,7 @@
+         if bad:
+             iss.append(("legacy_field_missing:%s" % f, "%s layout 缺 %s" % (kind, f)))
+     rec = {"layout": "legacy", "legacy_kind": kind, "ts": ts, "ts_iso": tsi, "pid": pid,
++           "writer": (d.get("writer") if isinstance(d.get("writer"), str) else ""),
+            "seq": seq, "level": lvl, "event": ev, "detail": dict(det),
+            "run": d.get("run") or d.get("run_id"),
+            "r3_fields": False, "canonical_event": ev, "raw_event": ev_raw}
+@@ -422,6 +458,7 @@
+     ev = d.get("event") if isinstance(d.get("event"), str) else None
+     rec = {"layout": "aux", "legacy_kind": "memguard", "ts": ts, "ts_iso": d.get("ts"),
+            "pid": d.get("pid") if isinstance(d.get("pid"), int) else None,
++           "writer": (d.get("writer") if isinstance(d.get("writer"), str) else ""),
+            "seq": d.get("seq") if isinstance(d.get("seq"), int) else None,
+            "level": "process", "event": ALIASES_V1.get(ev, ev), "detail": {},
+            "run": d.get("run_id"), "r3_fields": False,
+@@ -524,6 +561,11 @@
+                 # 旧布局：compat 模式只 warning（契约 §6「不判死」）；
+                 # 严格模式下一律硬违规（契约 §1「新写入一律 v2」）
+                 (rep.w if opts["compat_v1"] else rep.h)(kind, ex, r["origin"])
++            elif opts["compat_v1"] and kind in COMPAT_SOFT_KINDS:
++                # 契约 §8.2：compat 模式下缺 writer ⇒ 回退 (pid,"") 分组且**不判死**
++                # （v2.0 历史产物"对照读取"的意义；seq 偏差同源 ⇒ 一并降级并登记降级原因）
++                rep.w(kind, ex, r["origin"])
++                rep.d("compat_v1_seq_grouping_by_pid")
+             elif opt_kind_soft(kind, opts):
+                 rep.w(kind, ex, r["origin"])
+             else:
+@@ -541,47 +583,62 @@
+     elif stats["bad_tail"] and stats["parsed"] == 0:
+         rep.h("bad_lines", "整文件只有撕裂行，无可解析记录")
+ 
+-    # seq：同一文件内按 pid 分组，从 1 起严格 +1（契约 §3/§5.4）
++    # seq：同一文件内按 **(pid, writer)** 分组，从 1 起严格 +1（契约 §3/§5.4 + §8.2/§8.3）
++    #   v2.1：分组键加入 writer。理由（KI-1）：同一进程内可有多个写者各持独立计数器
++    #   （scrape.py 块级 "converge" × audit.py 请求级 "retry"），只按 pid 分组会误判重复。
++    #   compat 回退：缺 writer 的行按 writer=""（契约 §8.2）。
+     groups = {}
+     for r in records:
+         if not r["file_authoritative"] or r["layout"] == "aux":
+             continue
+         if isinstance(r.get("pid"), int) and isinstance(r.get("seq"), int):
+-            groups.setdefault((r["file"], r["pid"]), []).append(r)
++            groups.setdefault((r["file"], r["pid"], r.get("writer") or ""), []).append(r)
+     seq_groups = []
+-    for (f, pid), rs in sorted(groups.items()):
++    # compat 模式下**分组级** seq 偏差同源降级（契约 §6「不判死」+ §8.2）：缺少 writer 的
++    # v2.0 历史产物一旦回退按 pid 单键分组，其 seq 必然重复/缺号 —— 那是被读对象的历史形态，
++    # 不是本次运行的缺陷；不降级则"历史对照"永远 exit 1。严格模式不受影响（一律硬违规）。
++    def _seq_rep(kind, detail, origin=None):
++        if opts["compat_v1"]:
++            rep.w(kind, detail, origin)
++            rep.d("compat_v1_seq_grouping_by_pid")
++        else:
++            rep.h(kind, detail, origin)
++
++    for (f, pid, w), rs in sorted(groups.items()):
+         rs = sorted(rs, key=lambda x: x["line"])
+         seqs = [r["seq"] for r in rs]
+         expect = list(range(1, len(seqs) + 1))
+         ok = seqs == expect
+-        g = {"file": Path(f).name, "pid": pid, "count": len(rs), "seq_first": seqs[0],
+-             "seq_last": seqs[-1], "ok": ok, "continuous": seqs == expect}
++        g = {"file": Path(f).name, "pid": pid, "writer": w, "count": len(rs), "seq_first": seqs[0],
++             "seq_last": seqs[-1], "ok": ok, "continuous": seqs == expect,
++             "writer_key": bool(w)}
+         seq_groups.append(g)
+         if ok:
+             continue
++        _wtag = "writer=%s" % (w or "<missing>")
+         if seqs[0] != 1:
+-            rep.h("seq_group_not_from_1", "file=%s pid=%s 首条 seq=%s（要求 1）"
+-                  % (g["file"], pid, seqs[0]), "%s:%d" % (g["file"], rs[0]["line"]))
++            _seq_rep("seq_group_not_from_1", "file=%s pid=%s %s 首条 seq=%s（要求 1）"
++                     % (g["file"], pid, _wtag, seqs[0]), "%s:%d" % (g["file"], rs[0]["line"]))
+         seen, prev = set(), None
+         for r in rs:
+             s = r["seq"]
+             if s in seen:
+-                rep.h("seq_duplicate", "file=%s pid=%s seq=%s 重复" % (g["file"], pid, s),
+-                      r["origin"])
++                _seq_rep("seq_duplicate", "file=%s pid=%s %s seq=%s 重复"
++                         % (g["file"], pid, _wtag, s), r["origin"])
+             elif prev is not None and s < prev:
+-                rep.h("seq_reorder", "file=%s pid=%s seq=%s < 前一条 %s"
+-                      % (g["file"], pid, s, prev), r["origin"])
++                _seq_rep("seq_reorder", "file=%s pid=%s %s seq=%s < 前一条 %s"
++                         % (g["file"], pid, _wtag, s, prev), r["origin"])
+             elif prev is not None and s != prev + 1:
+-                rep.h("seq_gap", "file=%s pid=%s seq %s→%s 缺号"
+-                      % (g["file"], pid, prev, s), r["origin"])
++                _seq_rep("seq_gap", "file=%s pid=%s %s seq %s→%s 缺号"
++                         % (g["file"], pid, _wtag, prev, s), r["origin"])
+             seen.add(s)
+             prev = s
+ 
+-    # ts 非降（同 pid 组内；软违规）
++    # ts 非降（同 (文件, pid, writer) 组内；软违规）
+     tgroups = {}
+     for r in records:
+         if r["file_authoritative"] and not r.get("aux") and r.get("ts"):
+-            tgroups.setdefault((r["file"], r.get("pid")), []).append(r)
++            tgroups.setdefault((r["file"], r.get("pid"), r.get("writer") or ""), []).append(r)
+     for _k, rs in tgroups.items():
+         last = None
+         for r in sorted(rs, key=lambda x: x["line"]):
+@@ -598,11 +655,32 @@
+         by_layout[r["layout"]] = by_layout.get(r["layout"], 0) + 1
+     v2 = [r for r in records if r["layout"] == "v2"]
+     legacy = [r for r in records if r["layout"] == "legacy"]
++    writer_counts = {}
++    for r in records:
++        if r["layout"] == "v2" and not r.get("aux"):
++            k = r.get("writer") or "<missing>"
++            writer_counts[k] = writer_counts.get(k, 0) + 1
+     return {"seq_groups": seq_groups, "by_level": by_level, "by_event": by_event,
+             "by_layout": by_layout, "v2_records": len(v2), "legacy_records": len(legacy),
++            "writer_counts": writer_counts,
++            "writer_groups": len([g for g in seq_groups if g.get("writer_key")]),
++            "writerless_groups": len([g for g in seq_groups if not g.get("writer_key")]),
+             "authoritative_records": len([r for r in records if r["file_authoritative"]])}
+ 
+ 
++# 契约 §8.2：`--compat-v1` 下"缺 writer ⇒ 回退 (pid, \"\") 且不判死"所覆盖的偏差种类。
++# 缺 writer 的 v2.0 产物一旦回退按 pid 单键分组，其 seq 必然出现重复/缺号（这正是 KI-1 的
++# 现象本身）⇒ 必须同源降级，否则 compat 模式对历史产物永远 exit 1，"对照读取"名存实亡。
++# 严格模式（默认）下这些种类**全部是硬违规**，不受本表影响。
++COMPAT_SOFT_KINDS = frozenset([
++    "writer_missing",
++    "seq_duplicate",
++    "seq_gap",
++    "seq_reorder",
++    "seq_group_not_from_1",
++])
++
++
+ def opt_kind_soft(kind, opts):
+     """某些偏差在本契约下是 warning（不判死）——列出理由，避免"静默放宽"。"""
+     base = kind.split(":")[0]
+@@ -1018,7 +1096,10 @@
+         not any(s.get("windowed") for s in LINK.get(scenario or "", []))
+     all_audit = bool(checks) and all(c["channel"] == "audit" for c in checks)
+     canonical_pass = (not rep.hard) and (not fails) and all_audit and window_enforced \
+-        and facts["legacy_records"] == 0 and facts["v2_records"] > 0
++        and facts["legacy_records"] == 0 and facts["v2_records"] > 0 \
++        and "compat_v1_seq_grouping_by_pid" not in rep.degraded
++    # 说明（v2.1）：compat 回退按 (pid,"") 分组的对象**不是** v2.1 canonical 产物
++    # （缺 writer 行），故与 derived_only / no_window 同规格：降级可见 ⇒ canonical_pass=False。
+     if facts["legacy_records"] and opts["compat_v1"]:
+         rep.d("compat_v1_layout")
+     if derived_only:
+@@ -1040,12 +1121,16 @@
+         "v2_records": facts["v2_records"], "legacy_records": facts["legacy_records"],
+         "authoritative_records": facts["authoritative_records"],
+         "seq_groups": facts["seq_groups"],
++        "writer_counts": facts["writer_counts"],
++        "writer_groups": facts["writer_groups"],
++        "writerless_groups": facts["writerless_groups"],
+         "strict_pass": bool(facts["v2_records"]) and not rep.hard,
+         "canonical_pass": canonical_pass,
+         "r3_fields_pass": canonical_pass,
+     }
+     out = {
+         "verifier": "audit-verify-v2", "contract": "r3-audit-contract-v2",
++        "verifier_version": VERIFIER_VERSION, "contract_rev": CONTRACT_REV,
+         "mode": "compat-v1" if opts["compat_v1"] else "strict-v2",
+         "scenario": scenario, "scenario_dir": str(scenario_dir) if scenario_dir else None,
+         "files": files,
+@@ -1097,12 +1182,16 @@
+ def render(out, quiet=False):
+     L = []
+     s = out["schema"]
+-    L.append("== audit-verify-v2（契约 r3-audit-contract-v2，模式 %s）：场景 %s =="
+-             % (out["mode"], out["scenario"] or "(未指定)"))
++    L.append("== audit-verify-v2（契约 r3-audit-contract-v2 rev %s，实现 v%s，模式 %s）：场景 %s =="
++             % (out.get("contract_rev"), out.get("verifier_version"),
++                out["mode"], out["scenario"] or "(未指定)"))
+     L.append("审计输入 %d 个：%s" % (len(out["files"]),
+                                     ", ".join(Path(f).name for f in out["files"]) or "无"))
+     L.append("解析：行 %s / 成功 %s / 坏行 %s；布局 %s"
+              % (s["lines"], s["parsed"], s["bad_lines"], s["by_layout"]))
++    L.append("写者（契约 §8）：%s ⇒ writer 分组 %d 个 / 无 writer 分组 %d 个"
++             % (s.get("writer_counts") or {}, s.get("writer_groups"),
++                s.get("writerless_groups")))
+     L.append("字段/枚举/单调：硬违规 %d，软违规 %d；v2 记录 %d；legacy 记录 %d；"
+              "canonical_pass=%s；strict_pass=%s"
+              % (s["hard_deviations"], s["soft_deviations"], s["v2_records"],
+@@ -1116,9 +1205,10 @@
+         L.append("    · warn %-28s ×%d  %s" % (kind, cnt, ex[:140]))
+     gs = s["seq_groups"]
+     if gs:
+-        L.append("seq 分组（同文件内按 pid，要求 1..N 连续）：%s"
+-                 % "; ".join("%s pid=%s %d 条 %s" % (g["file"], g["pid"], g["count"],
+-                                                     "OK" if g["ok"] else "违规")
++        L.append("seq 分组（同文件内按 (pid, writer)，要求 1..N 连续）：%s"
++                 % "; ".join("%s pid=%s writer=%s %d 条 %s"
++                             % (g["file"], g["pid"], g.get("writer") or "<missing>",
++                                g["count"], "OK" if g["ok"] else "违规")
+                              for g in gs[:6]))
+     if out["lineage"]:
+         L.append("血缘：evidence=%s；真实证据 %d 件；读数=%s；run 窗口=%s；pid 关联=%s"
+@@ -1270,8 +1360,8 @@
+ def emit(seq, level, event, detail):
+     r = {"schema": "r3-audit-v2", "ts_epoch": round(time.time(), 6),
+          "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime()) + ".000",
+-         "pid": pid, "seq": seq, "level": level, "event": event, "detail": detail,
+-         "run": "selftest-real"}
++         "pid": pid, "writer": "retry", "seq": seq, "level": level, "event": event,
++         "detail": detail, "run": "selftest-real"}
+     recs.append(r)
+ emit(1, "request", "error_classified", {"class": "conn_reset", "action": "retry"})
+ emit(2, "request", "retry_scheduled", {"attempt": 1, "wait_s": 2.0})
+@@ -1359,8 +1449,8 @@
+     shutil.copytree(d, d6)
+     with open(d6 / "out" / "audit.jsonl", "a", encoding="utf-8") as f:
+         f.write(json.dumps({"schema": "r3-audit-v2", "ts_epoch": time.time(),
+-                            "ts_iso": _iso(time.time()), "pid": 515151, "seq": 7,
+-                            "level": "request", "event": "retry_scheduled",
++                            "ts_iso": _iso(time.time()), "pid": 515151, "writer": "retry",
++                            "seq": 7, "level": "request", "event": "retry_scheduled",
+                             "detail": {}, "run": "x"}) + "\n")
+     rc, r = run(["--scenario", "S4", "--scenario-dir", str(d6)])
+     chk("newpid.exit1", rc == 1 and r["exit_code"] == 1
+@@ -1419,7 +1509,8 @@
+     shutil.copytree(d, d11)
+     (d11 / "out" / "audit.jsonl").write_text(
+         json.dumps({"schema": "r3-audit-v2", "ts_epoch": inj, "ts_iso": _iso(inj),
+-                    "pid": pid, "seq": 1, "level": "process", "event": "run_start",
++                    "pid": pid, "writer": "retry", "seq": 1, "level": "process",
++                    "event": "run_start",
+                     "detail": {}, "run": "selftest-real"}) + "\n", encoding="utf-8")
+     rc, r = run(["--scenario", "S4", "--scenario-dir", str(d11)])
+     chk("derived_only.not_canonical", r["canonical_pass"] is False
+@@ -1450,6 +1541,129 @@
+     rc, r = run(["--scenario", "S4", "--scenario-dir", str(d14)])
+     chk("empty_input.exit2", rc == 2 and r["exit_code"] == 2)
+ 
++    # ================= 契约 §8（v2.1）：writer 分组键 / KI-1 回归 =================
++    # 夹具①：**同 pid 双写者合流**（模拟真实 S4：scrape.py 的 converge 写者 × audit.py 的
++    # retry 写者共用 pid 与同一 OUT/audit.jsonl，各持独立计数器）⇒ 必须 **PASS**。
++    merged_rows = []
++    for i in (1, 2, 3):
++        merged_rows.append({"schema": "r3-audit-v2", "ts_epoch": inj - 2 + i * 0.1,
++                            "ts_iso": _iso(inj - 2 + i * 0.1), "pid": pid, "writer": "retry",
++                            "seq": i, "level": "request",
++                            "event": ["error_classified", "retry_scheduled",
++                                      "retry_scheduled"][i - 1],
++                            "detail": {"attempt": i, "wait_s": float(i)}, "run": "selftest-real"})
++        merged_rows.append({"schema": "r3-audit-v2", "ts_epoch": inj - 2 + i * 0.1 + 0.05,
++                            "ts_iso": _iso(inj - 2 + i * 0.1 + 0.05), "pid": pid,
++                            "writer": "converge", "seq": i, "level": "block",
++                            "event": ["run_start", "probe_all_dead",
++                                      "convergence_decision"][i - 1],
++                            "detail": {"round": i}, "run": "selftest-real"})
++    d_dual = root / "S4-dualwriter"
++    shutil.copytree(d, d_dual)
++    p_dual = d_dual / "out" / "audit.jsonl"
++    p_dual.write_text("".join(json.dumps(x, ensure_ascii=False) + "\n" for x in merged_rows),
++                      encoding="utf-8")
++    rc, r = run(["--scenario", "S4", "--scenario-dir", str(d_dual)])
++    groups = (r.get("schema") or {}).get("seq_groups") or []
++    chk("dualwriter.same_pid_pass", rc == 0 and r["exit_code"] == 0
++        and not [h for h in r["hard_violations"] if h["kind"].startswith("seq_")],
++        "rc=%s hard=%s groups=%s" % (rc, [h["kind"] for h in r["hard_violations"]][:4],
++                                     [(g["pid"], g["writer"], g["count"], g["ok"]) for g in groups]))
++    chk("dualwriter.two_groups_both_continuous",
++        len(groups) == 2 and all(g["ok"] for g in groups)
++        and sorted(g["writer"] for g in groups) == ["converge", "retry"]
++        and {g["pid"] for g in groups} == {pid},
++        [(g["pid"], g["writer"], g["seq_first"], g["seq_last"], g["ok"]) for g in groups])
++    chk("dualwriter.writer_stats",
++        (r["schema"].get("writer_groups") == 2 and r["schema"].get("writerless_groups") == 0
++         and (r["schema"].get("writer_counts") or {}) == {"retry": 3, "converge": 3}),
++        json.dumps({"counts": r["schema"].get("writer_counts"),
++                    "groups": r["schema"].get("writer_groups")}, ensure_ascii=False))
++    # 同字节、仅去掉 writer ⇒ compat 回退按 (pid,"") 分组 ⇒ KI-1 签名（seq_duplicate）复现
++    d_dual_nw = root / "S4-dualwriter-nowriter"
++    shutil.copytree(d, d_dual_nw)
++    (d_dual_nw / "out" / "audit.jsonl").write_text(
++        "".join(json.dumps({k: v for k, v in x.items() if k != "writer"}, ensure_ascii=False)
++                + "\n" for x in merged_rows), encoding="utf-8")
++    rc, r = run(["--scenario", "S4", "--scenario-dir", str(d_dual_nw), "--compat-v1"])
++    dups = [w for w in r["warnings"] if w["kind"] == "seq_duplicate"]
++    chk("dualwriter.pid_only_key_would_dup",
++        len(dups) >= 3 and (r["schema"].get("writerless_groups") == 1),
++        "同一份字节去掉 writer ⇒ 按 pid 单键分组复现 %d 条 seq_duplicate（= KI-1 签名）"
++        % len(dups))
++
++    # 夹具②：**跨组 seq 交错**（1,1,2,2,3,3 交替），分组必须正确、不得误判
++    d_il = root / "S4-interleave"
++    shutil.copytree(d, d_il)
++    inter = []
++    for i in range(6):
++        w = "retry" if i % 2 == 0 else "converge"
++        n = i // 2 + 1
++        inter.append({"schema": "r3-audit-v2", "ts_epoch": inj - 1 + i * 0.01,
++                      "ts_iso": _iso(inj - 1 + i * 0.01), "pid": pid, "writer": w, "seq": n,
++                      "level": "request" if w == "retry" else "block",
++                      "event": ("retry_scheduled" if w == "retry" else "probe_retry"),
++                      "detail": {"i": i}, "run": "selftest-real"})
++    (d_il / "out" / "audit.jsonl").write_text(
++        "".join(json.dumps(x, ensure_ascii=False) + "\n" for x in inter), encoding="utf-8")
++    rc, r = run(["--scenario", "S4", "--scenario-dir", str(d_il)])
++    groups = (r.get("schema") or {}).get("seq_groups") or []
++    chk("interleave.no_false_positive",
++        rc == 0 and r["exit_code"] == 0 and len(groups) == 2 and all(g["ok"] for g in groups)
++        and not [h for h in r["hard_violations"] if h["kind"].startswith("seq_")],
++        "交错行序 %s ⇒ 分组 %s"
++        % ([x["writer"][0] + str(x["seq"]) for x in inter],
++           [(g["writer"], g["seq_first"], g["seq_last"], g["ok"]) for g in groups]))
++
++    # ---------- 反例 13：严格模式缺 writer ⇒ 硬违规 writer_missing ----------
++    d_wm = root / "S4-writermissing"
++    shutil.copytree(d, d_wm)
++    p_wm = d_wm / "out" / "audit.jsonl"
++    rows_wm = [json.loads(x) for x in p_wm.read_text(encoding="utf-8").splitlines() if x.strip()]
++    p_wm.write_text("".join(json.dumps({k: v for k, v in x.items() if k != "writer"},
++                                       ensure_ascii=False) + "\n" for x in rows_wm),
++                    encoding="utf-8")
++    rc, r = run(["--scenario", "S4", "--scenario-dir", str(d_wm)])
++    chk("writer_missing.strict_fail", rc == 1 and r["exit_code"] == 1
++        and any(h["kind"] == "writer_missing" for h in r["hard_violations"]),
++        [h["kind"] for h in r["hard_violations"]][:4])
++    chk("writer_missing.strict_pass_false", r["schema"]["strict_pass"] is False
++        and r["schema"].get("writerless_groups") == 1,
++        "writerless_groups=%s" % r["schema"].get("writerless_groups"))
++    # 契约 §8.2：compat 模式回退 (pid,"") 分组且**不判死**
++    rc, r = run(["--scenario", "S4", "--scenario-dir", str(d_wm), "--compat-v1"])
++    chk("writer_missing.compat_downgrade", rc == 0 and r["exit_code"] == 0
++        and any(w["kind"] == "writer_missing" for w in r["warnings"])
++        and "compat_v1_seq_grouping_by_pid" in r["degraded_reasons"]
++        and r["canonical_pass"] is False,
++        "rc=%s hard=%s warnings=%s degraded=%s" % (rc, [h["kind"] for h in r["hard_violations"]][:4],
++                                                   sorted({w["kind"] for w in r["warnings"]}),
++                                                   r["degraded_reasons"]))
++    chk("writer_missing.compat_group_key", (r["schema"].get("seq_groups") or [{}])[0].get("writer")
++        == "" and r["schema"].get("writerless_groups") == 1,
++        json.dumps(r["schema"].get("seq_groups"), ensure_ascii=False)[:160])
++
++    # ---------- R-9：keeper 写入名与校验器事件表对齐（两侧一张表） ----------
++    keeper = HERE / "keeper-v3.sh"
++    if keeper.exists():
++        ksrc = keeper.read_text(encoding="utf-8", errors="replace")
++        m_alias = re.search(r'R3_ALIAS_EVENTS="([^"]*)"', ksrc)
++        alias_canon = [p.split(":")[0] for p in (m_alias.group(1).split() if m_alias else [])]
++        calls = sorted(set(re.findall(r"(?:^|[\s;(&|])audit\s+([a-z_]+)", ksrc, re.M)))
++        # 写入名 = r3_event_of(调用名)：别名表右端命中 ⇒ 取左端 canonical，否则原样
++        alias_map = {}
++        for p in (m_alias.group(1).split() if m_alias else []):
++            left, _, right = p.partition(":")
++            alias_map[right] = left
++        written = sorted({alias_map.get(c, c) for c in calls} | set(alias_canon))
++        missing = [e for e in written
++                   if e not in EVENT_LEVELS and e not in ("restart", "adopt")]
++        chk("keeper.event_table_aligned", not missing,
++            "keeper 写入名 %d 个，表外 %d 个：%s" % (len(written), len(missing), missing))
++    else:
++        print("  [SKIP] keeper.event_table_aligned：%s 不在本目录（未校验两侧事件表对齐）"
++              % keeper.name)
++
+     # ---------- derived 模式表与 drilllib 一致 ----------
+     try:
+         sys.path.insert(0, str(HERE))
+--- a/test_converge.py
++++ b/test_converge.py
+@@ -32,6 +32,48 @@
+ SANDBOX = HERE / 'sandbox'                  # R3p4/slot-converge-f1 路径适配（不再写 R3/）
+ READINGS = HERE / 'test-results'
+ 
++# ===========================================================================
++# 靶模式（R3-P4·P4.5 · R-4 修复）
++# ---------------------------------------------------------------------------
++# 病灶（KI-3/R-4）：本套件有 3 条断言是**单槽不变量**，在任何「合流靶」上必然失败：
++#   · scope-discipline：scope-check.py 判"改动是否全落在 **converge 槽登记区域**内"；
++#   · fetch/get_total 逐字节未变：converge 槽承诺不碰 fetch，而 retry 槽的重试逻辑就写在 fetch 里；
++#   · patch-roundtrip：断言"converge-f1.patch 施加回 converge 产物 == 本目录 scrape.py"
++#     （自指血缘不变量；合流版还含 retry 段 ⇒ 必然不等）。
++# 处置（与 KI-4 同法：只改候选副本、fail-closed、lineage/ 留档、原件只读）：
++#   **合流模式（merge）**把这三条换成**合流作用域下的等价不变量**（强于"整条豁免"）：
++#   ① 分支重建：把 r2cand 按补丁链重放成分支件（converge 分支 / retry 分支 / 合流件），
++#      每一步 --fuzz=0，且可核对时**必须**与只读槽产物逐字节一致；
++#   ② scope-discipline(merge)：converge 分支件本身仍过单槽纪律（同一算法、换靶）+ MOD 的
++#      **变更区域集合**必须恰好等于两分支区域之并（无外来改动）+ new_defs 并集闭合；
++#   ③ fetch/get_total(merge)：get_total 逐字节未变（原判据保留）+ MOD 的 fetch 体与 **retry
++#      分支件**逐字节相同（归因：converge 对 fetch 零贡献，且 retry 的贡献真实存在）；
++#   ④ patch-roundtrip(merge)：**全链重放**（retry→retry-fatal→converge→converge-f1→
++#      align-converge[→v2.1 增量]）逐字节还原本目录 scrape.py —— 比单槽自指往返更强的
++#      "交付物自洽性"证据。
++# 模式解析：`--target-mode auto|single|merge`；auto = 同目录同时有 converge.patch 与
++#   retry.patch（即合流/生产者树）⇒ merge，否则 single。解析结果**写进读数**，绝不静默换靶。
++# ===========================================================================
++TARGET_MODE = 'single'          # 由 main() 按 --target-mode 解析后设定
++
++# 合流链（顺序 = 施加顺序；每条都必须 --fuzz=0 通过）：
++#   分支 C（converge 单槽）: r2cand +converge +converge-f1
++#   分支 R（retry   单槽）: r2cand +retry +retry-fatal
++#   合流 V2.0            : 分支R +converge +converge-f1 +audit-align-converge
++#   合流 V2.1（= 本目录）: 合流V2.0 +lineage/scrape-v2.0-to-v2.1.diff（存在时）
++MERGE_CHAIN_CONV = ['converge.patch', 'converge-f1.patch']
++MERGE_CHAIN_RETRY = ['retry.patch', 'retry-fatal-scrape.patch']
++MERGE_CHAIN_MERGED = ['retry.patch', 'retry-fatal-scrape.patch', 'converge.patch',
++                      'converge-f1.patch', 'audit-align-converge.patch']
++MERGE_DELTA = 'lineage/scrape-v2.0-to-v2.1.diff'    # v2.1 增量（候选副本的 lineage 留档）
++# 只读外部参照（可核对时逐字节比对；缺席 ⇒ 读数显式记 skipped，但合流链本身的判据不放宽）
++MERGE_REF_SLOTS = {
++    'conv_slot': '/tmp/lib-opt-work/R3/impl/slot-converge/scrape.py',
++    'conv_f1_slot': '/tmp/lib-opt-work/R3p4/slot-converge-f1/scrape.py',
++    'retry_slot': '/tmp/lib-opt-work/R3/impl/slot-retry/scrape.py',
++    'retry_fatal_slot': '/tmp/lib-opt-work/R3p4/slot-retry-fatal/scrape.py',
++}
++
+ CATALOG_SEED = 20260915
+ CATALOG_N = 1200            # 种子 'A' 的库藏量（> LEAF_MAX=490 ⇒ 必须走分支细分）
+ SLEEP_FAST_GE = 5.0         # ≥ 该值的 sleep 在测试进程内被压缩（30/45/20s 的冷却）
+@@ -686,8 +728,141 @@
+     return c
+ 
+ 
++# ===========================================================================
++# 合流模式支持（R-4）：补丁链重放 / AST 区域代数 / 函数体归因
++# ===========================================================================
++def _patch_apply(patch_name, src, dst):
++    """--fuzz=0 施加一条补丁（src → dst）。返回 (rc, stderr 摘要)。绝不吞失败。"""
++    r = subprocess.run(['patch', '--fuzz=0', '-s', '-o', str(dst), '-i', str(HERE / patch_name),
++                        str(src)], capture_output=True, text=True, timeout=120)
++    return r.returncode, (r.stdout or '') + (r.stderr or '')
++
++
++def _spans(path):
++    """顶层定义 → (start, end)（与 scope-check.py 同算法）。"""
++    import ast
++    tree = ast.parse(Path(path).read_text(encoding='utf-8'))
++    return {n.name: (n.lineno, getattr(n, 'end_lineno', n.lineno)) for n in tree.body
++            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
++
++
++def _body(path, name):
++    """顶层定义的函数体（含 def 行）逐行列表；不存在 ⇒ None。"""
++    lines = Path(path).read_text(encoding='utf-8').splitlines(keepends=True)
++    sp = _spans(path)
++    if name not in sp:
++        return None
++    s, e = sp[name]
++    return lines[s - 1:e]
++
++
++def _changed_regions(a, b):
++    """b 相对 a 的**变更区域集合**（顶层定义名；模块级行统一归 '<module-level>'）。"""
++    import difflib
++    al = Path(a).read_text(encoding='utf-8').splitlines(keepends=True)
++    bl = Path(b).read_text(encoding='utf-8').splitlines(keepends=True)
++    sm = difflib.SequenceMatcher(None, al, bl, autojunk=False)
++    sp = _spans(b)
++    out = set()
++    for tag, _i1, _i2, j1, j2 in sm.get_opcodes():
++        if tag == 'equal':
++            continue
++        for j in range(j1 + 1, j2 + 1):
++            name = None
++            for n, (s, e) in sp.items():
++                if s <= j <= e:
++                    name = n
++                    break
++            out.add(name or '<module-level>')
++    return out
++
++
++def _new_defs(a, b):
++    return set(_spans(b)) - set(_spans(a))
++
++
++def build_merge_refs():
++    """按补丁链重建分支件/合流件（fail-closed）。返回 (refs, errors)。"""
++    refs, errors = {}, []
++    d = SANDBOX / 'merge'
++    if d.exists():
++        shutil.rmtree(d)
++    d.mkdir(parents=True)
++    base = d / 'r2cand.py'
++    shutil.copy2(BASELINE, base)
++    # 分支 C：converge 单槽
++    cur, names = base, []
++    for pn in MERGE_CHAIN_CONV:
++        nxt = d / ('conv_%d.py' % (len(names) + 1))
++        rc, err = _patch_apply(pn, cur, nxt)
++        if rc != 0:
++            errors.append('%s 施加失败（rc=%d）：%s' % (pn, rc, err.strip()[:200]))
++            break
++        cur = nxt
++        names.append(pn)
++    refs['conv_branch'] = cur
++    refs['conv_chain'] = names
++    # 分支 R：retry 单槽
++    cur, names = base, []
++    for pn in MERGE_CHAIN_RETRY:
++        nxt = d / ('retry_%d.py' % (len(names) + 1))
++        rc, err = _patch_apply(pn, cur, nxt)
++        if rc != 0:
++            errors.append('%s 施加失败（rc=%d）：%s' % (pn, rc, err.strip()[:200]))
++            break
++        cur = nxt
++        names.append(pn)
++    refs['retry_branch'] = cur
++    refs['retry_chain'] = names
++    # 合流 V2.0 →（可选）v2.1 增量 → 本目录 scrape.py
++    cur, names = base, []
++    for pn in MERGE_CHAIN_MERGED:
++        nxt = d / ('merged_%d.py' % (len(names) + 1))
++        rc, err = _patch_apply(pn, cur, nxt)
++        if rc != 0:
++            errors.append('%s 施加失败（rc=%d）：%s' % (pn, rc, err.strip()[:200]))
++            break
++        cur = nxt
++        names.append(pn)
++    refs['merged_v20'] = cur
++    refs['merged_chain'] = names
++    delta = HERE / MERGE_DELTA
++    if delta.exists():
++        nxt = d / 'merged_v21.py'
++        rc, err = _patch_apply(MERGE_DELTA, cur, nxt)
++        if rc != 0:
++            errors.append('%s 施加失败（rc=%d）：%s' % (MERGE_DELTA, rc, err.strip()[:200]))
++        else:
++            cur = nxt
++            refs['chain_with_delta'] = MERGE_CHAIN_MERGED + [MERGE_DELTA]
++    refs['chain_end'] = cur            # 链的终点：应当逐字节等于本目录 scrape.py
++    refs['delta_present'] = delta.exists()
++    refs['dir'] = d
++    # 只读参照逐字节核对（缺席 ⇒ 记 skipped，不算失败，但读数里显式标注）
++    checks = {}
++    for key, path in MERGE_REF_SLOTS.items():
++        p = Path(path)
++        if not p.exists():
++            checks[key] = {'ref': path, 'status': 'skipped_missing'}
++            continue
++        rel = {'conv_slot': refs['conv_chain'][:1] and d / 'conv_1.py',
++               'conv_f1_slot': refs['conv_branch'],
++               'retry_slot': d / 'retry_1.py',
++               'retry_fatal_slot': refs['retry_branch']}.get(key)
++        same = bool(rel and rel.exists() and rel.read_bytes() == p.read_bytes())
++        checks[key] = {'ref': path, 'status': 'match' if same else 'mismatch',
++                       'ours': (_md5(rel) if rel and rel.exists() else None),
++                       'slot': _md5(p)}
++    refs['slot_crosscheck'] = checks
++    return refs, errors
++
++
+ def scenario_scope(report):
+-    """改动区域机器核对：全部变更必须落在登记区域内，且 fetch/get_total 函数体逐字节未变。"""
++    """改动区域机器核对：全部变更必须落在登记区域内，且 fetch/get_total 函数体逐字节未变。
++
++    合流模式（TARGET_MODE == 'merge'）下换为合流作用域不变量，见文件头「靶模式」说明。"""
++    if TARGET_MODE == 'merge':
++        return _scenario_scope_merge(report)
+     c = Checks('scope-discipline')
+     p = subprocess.run([sys.executable, str(HERE / 'scope-check.py'), '--json'],
+                        capture_output=True, text=True, timeout=120)
+@@ -706,6 +881,64 @@
+           '新增顶层定义（R3 助手区）', f"{len(rep.get('new_defs') or [])} 个")
+     report['scope'] = {k: rep.get(k) for k in ('ok', 'forbidden_untouched', 'violations',
+                                                'changed_mod_lines')}
++    report['scope']['target_mode'] = 'single'
++    return c
++
++
++def _scenario_scope_merge(report):
++    """合流靶的区域纪律：分支自重 + 区域并集闭合 + fetch/get_total 归因（R-4）。"""
++    c = Checks('scope-discipline')
++    refs, errors = build_merge_refs()
++    if errors:
++        c.add(False, '合流补丁链重放（fail-closed）', '; '.join(errors)[:300])
++        report['scope'] = {'target_mode': 'merge', 'chain_errors': errors}
++        return c
++    conv, retry = refs['conv_branch'], refs['retry_branch']
++    # ① converge 分支件仍过**同一套单槽纪律**（同一算法，靶换成重建出的分支件）
++    p = subprocess.run([sys.executable, str(HERE / 'scope-check.py'), '--json',
++                        '--ref', str(conv)], capture_output=True, text=True, timeout=120)
++    try:
++        rep = json.loads(p.stdout)
++    except ValueError:
++        rep = {}
++    c.add(p.returncode == 0 and rep.get('ok') is True,
++          '§合流① converge 分支件自身仍全在登记区域（scope-check 同算法换靶；合流不改写 converge 纪律）',
++          f"ref={Path(str(conv)).name} rc={p.returncode} "
++          f"violations={len(rep.get('violations') or [])} regions={len(rep.get('regions') or {})}")
++    # ② 区域并集**恰好闭合**：MOD 的变更区域 == converge 分支 ∪ retry 分支（无外来改动）
++    r_base = _changed_regions(BASELINE, MODIFIED)
++    r_conv = _changed_regions(BASELINE, conv)
++    r_retry = _changed_regions(BASELINE, retry)
++    extra, missing = sorted(r_base - (r_conv | r_retry)), sorted((r_conv | r_retry) - r_base)
++    c.add(not extra and not missing,
++          '§合流② MOD 的变更区域集合 == converge 分支 ∪ retry 分支（无外来改动、无遗漏）',
++          f"MOD={len(r_base)} conv={len(r_conv)} retry={len(r_retry)} "
++          f"外来={extra[:6]} 未覆盖={missing[:6]}")
++    nd_base = _new_defs(BASELINE, MODIFIED)
++    nd_union = _new_defs(BASELINE, conv) | _new_defs(BASELINE, retry)
++    c.add(nd_base == nd_union and len(nd_base) >= 20,
++          '§合流②′ 新增顶层定义集合 == 两分支新增之并（合流未凭空增删定义）',
++          f"MOD={len(nd_base)} 并集={len(nd_union)} 差={sorted(nd_base ^ nd_union)[:6]}")
++    # ③ fetch / get_total 归因：get_total 未变（原判据）+ fetch 与 retry 分支件逐字节相同
++    gt_same = _body(BASELINE, 'get_total') == _body(MODIFIED, 'get_total')
++    fetch_same = _body(MODIFIED, 'fetch') == _body(retry, 'fetch')
++    fetch_moved = _body(BASELINE, 'fetch') != _body(MODIFIED, 'fetch')
++    c.add(gt_same and fetch_same and fetch_moved,
++          '§合流③ get_total 逐字节未变 + fetch 体 == retry 分支件（converge 对 fetch 零贡献）',
++          f"get_total_untouched={gt_same} fetch==retry_branch={fetch_same} "
++          f"fetch_changed_vs_baseline={fetch_moved}")
++    report['scope'] = {
++        'target_mode': 'merge',
++        'conv_branch_md5': _md5(conv), 'retry_branch_md5': _md5(retry),
++        'conv_chain': refs['conv_chain'], 'retry_chain': refs['retry_chain'],
++        'regions': {'mod': sorted(r_base), 'conv': sorted(r_conv), 'retry': sorted(r_retry),
++                    'foreign': extra, 'uncovered': missing},
++        'new_defs': {'mod': len(nd_base), 'union': len(nd_union)},
++        'forbidden_attribution': {'get_total_untouched': gt_same, 'fetch_eq_retry_branch': fetch_same,
++                                  'fetch_changed_vs_baseline': fetch_moved},
++        'conv_branch_scope': {k: rep.get(k) for k in ('ok', 'violations', 'changed_mod_lines')},
++        'slot_crosscheck': refs['slot_crosscheck'],
++    }
+     return c
+ 
+ 
+@@ -714,7 +947,11 @@
+ 
+     补丁本体由任务书指定命令生成（cd /tmp/lib-opt-work && diff -u R3/impl/slot-converge/scrape.py
+     R3p4/slot-converge-f1/scrape.py > converge-f1.patch）⇒ 头部标签即这两个相对路径；
+-    本用例在沙箱内重建同名目录树并用 `patch -p0 -o` 落到指定输出文件后逐字节比对。"""
++    本用例在沙箱内重建同名目录树并用 `patch -p0 -o` 落到指定输出文件后逐字节比对。
++
++    合流模式（TARGET_MODE == 'merge'）下换为**全链重放**（见 _scenario_patch_merge）。"""
++    if TARGET_MODE == 'merge':
++        return _scenario_patch_merge(report)
+     c = Checks('patch-roundtrip')
+     patch = HERE / 'converge-f1.patch'
+     PREV = Path('/tmp/lib-opt-work/R3/impl/slot-converge/scrape.py')   # 只读：改前产物（= 补丁左端）
+@@ -740,7 +977,48 @@
+     c.add(patch.stat().st_size > 5000, 'converge-f1.patch 已生成',
+           f"{patch.stat().st_size} bytes, {len(patch.read_text().splitlines())} 行")
+     report['patch'] = {'bytes': patch.stat().st_size, 'apply_rc': ap.returncode,
+-                       'identical': same}
++                       'identical': same, 'target_mode': 'single'}
++    return c
++
++
++def _scenario_patch_merge(report):
++    """合流靶的产物自洽（R-4）：**全链重放**逐字节还原本目录 scrape.py。
++
++    单槽断言"converge-f1.patch 结果 == 本目录 scrape.py"在合流树上必然失败（自指血缘不变量）。
++    合流模式下换成更强、也更贴合的陈述：把 r2cand 按**记录在案的补丁链**重放
++    （retry → retry-fatal → converge → converge-f1 → audit-align-converge → v2.1 增量），
++    终点必须与本目录 scrape.py **逐字节一致**，且能与只读槽产物对上的中间件必须对上。
++    任一步 --fuzz=0 施加失败或不一致 ⇒ FAIL（fail-closed）。"""
++    c = Checks('patch-roundtrip')
++    refs, errors = build_merge_refs()
++    if errors:
++        c.add(False, '合流补丁链可干净重放（每步 --fuzz=0）', '; '.join(errors)[:300])
++        report['patch'] = {'target_mode': 'merge', 'chain_errors': errors}
++        return c
++    end = Path(refs['chain_end'])
++    same = end.read_bytes() == MODIFIED.read_bytes()
++    c.add(same, '§合流④ 全链重放（r2cand + 5 条补丁%s）逐字节还原本目录 scrape.py'
++          % (' + v2.1 增量' if refs.get('delta_present') else ''),
++          f"chain={'->'.join(Path(p).name for p in (refs.get('chain_with_delta')
++                                                    or refs['merged_chain']))} "
++          f"sha={_md5(end)}/{_md5(MODIFIED)} identical={same}")
++    xc = refs['slot_crosscheck']
++    matched = [k for k, v in xc.items() if v['status'] == 'match']
++    mismatched = [k for k, v in xc.items() if v['status'] == 'mismatch']
++    c.add(not mismatched and len(matched) >= 2,
++          '§合流④′ 分支重建件与只读槽产物逐字节一致（converge/converge-f1/retry/retry-fatal）',
++          f"match={matched} mismatch={mismatched} "
++          f"skipped={[k for k, v in xc.items() if v['status'].startswith('skipped')]}")
++    total = sum((HERE / p).stat().st_size for p in MERGE_CHAIN_MERGED if (HERE / p).exists())
++    c.add(total > 5000 and not refs.get('chain_with_delta') is None,
++          '§合流④″ 补丁链留档齐备（各补丁文件在场且含实质内容）',
++          f"{len(refs['merged_chain'])} 条 / {total} bytes"
++          f"{' + ' + MERGE_DELTA if refs.get('delta_present') else '（无 v2.1 增量文件）'}")
++    report['patch'] = {'target_mode': 'merge',
++                       'chain': refs.get('chain_with_delta') or refs['merged_chain'],
++                       'chain_end_md5': _md5(end), 'modified_md5': _md5(MODIFIED),
++                       'identical': same, 'slot_crosscheck': xc,
++                       'merged_v20_md5': _md5(refs['merged_v20'])}
+     return c
+ 
+ 
+@@ -776,18 +1054,34 @@
+     return c
+ 
+ 
++def resolve_target_mode(requested):
++    """靶模式解析（R-4）。auto = 同目录同时有 converge.patch 与 retry.patch ⇒ merge。"""
++    if requested in ('single', 'merge'):
++        return requested, 'explicit(--target-mode %s)' % requested
++    merged = (HERE / 'converge.patch').exists() and (HERE / 'retry.patch').exists()
++    return ('merge' if merged else 'single',
++            'auto(converge.patch=%s retry.patch=%s)'
++            % ((HERE / 'converge.patch').exists(), (HERE / 'retry.patch').exists()))
++
++
+ def main():
++    global TARGET_MODE
+     ap = argparse.ArgumentParser()
+     ap.add_argument('--child')
+     ap.add_argument('--module')
+     ap.add_argument('--out')
++    ap.add_argument('--target-mode', default='auto', choices=('auto', 'single', 'merge'),
++                    help='single=单槽不变量（原判据）；merge=合流作用域不变量（R-4）；'
++                         'auto=按同目录补丁留档自动判定')
+     args = ap.parse_args()
+     if args.child:
+         return child_main(args)
+ 
++    TARGET_MODE, mode_src = resolve_target_mode(args.target_mode)
+     SANDBOX.mkdir(parents=True, exist_ok=True)
+     READINGS.mkdir(parents=True, exist_ok=True)
+     report = {'ts': time.time(), 'baseline_md5': _md5(BASELINE), 'modified_md5': _md5(MODIFIED),
++              'target_mode': TARGET_MODE, 'target_mode_source': mode_src,
+               'catalog': {'seed': CATALOG_SEED, 'n': CATALOG_N, 'total_A': total_of('A'),
+                           'children_A_nonzero': sum(1 for ch in string.digits + string.ascii_uppercase
+                                                     if total_of('A' + ch) > 0)}}
+@@ -797,7 +1091,11 @@
+               scenario_scope_and_reconcile(report), scenario_scope(report),
+               scenario_patch(report), scenario_e2e(report)]
+     print('=' * 100)
+-    print('R3·slot-converge 测试读数（基线 = R3/refs/scrape-r2cand.py，改后 = slot-converge/scrape.py）')
++    print('R3·slot-converge 测试读数（基线 = R3/refs/scrape-r2cand.py，改后 = 本目录 scrape.py）')
++    print('靶模式 TARGET_MODE=%s（来源 %s）：%s'
++          % (TARGET_MODE, mode_src,
++             '本目录含 converge.patch+retry.patch ⇒ 三条单槽不变量换为合流作用域等价判据（R-4）'
++             if TARGET_MODE == 'merge' else '单槽靶 ⇒ 原判据（与 slot-converge-f1 一致）'))
+     print('=' * 100)
+     n_fail = 0
+     for s in suites:
+@@ -812,11 +1110,12 @@
+     report['suites'] = [{'name': s.name, 'ok': s.ok, 'items': s.items} for s in suites]
+     report['pass'] = n_fail == 0
+     report['n_fail'] = n_fail
++    report['target_mode_resolved'] = TARGET_MODE
+     slim = _slim(report)
+     (READINGS / 'readings.json').write_text(json.dumps(slim, ensure_ascii=False, indent=1),
+                                             encoding='utf-8')
+     print('\n' + '=' * 100)
+-    print(f"TOTAL: {'PASS' if n_fail == 0 else 'FAIL'}（失败断言 {n_fail} 条）"
++    print(f"TOTAL: {'PASS' if n_fail == 0 else 'FAIL'}（失败断言 {n_fail} 条，靶模式 {TARGET_MODE}）"
+           f"  读数文件: {READINGS / 'readings.json'}")
+     print('=' * 100)
+     return 0 if n_fail == 0 else 1
+--- a/test_retry.py
++++ b/test_retry.py
+@@ -602,6 +602,11 @@
+           all(set(e) >= {'schema', 'ts_epoch', 'ts_iso', 'pid', 'seq', 'level', 'event', 'detail', 'run'}
+               for e in ev))
+     check('T9.契约 §1 负判据：v2 行不写遗留键 ts', all('ts' not in e for e in ev))
++    # [P4.5·v2.1 R-8/KI-1] 契约 §8 回归护栏：v2.1 起每行必须带写者分组键 writer（写侧 = "retry"）。
++    #   与 §1 负判据同规格：把"新写入不得产生无 writer 行"（契约 §8.5）变成可执行的回归护栏。
++    check('T9.契约 §8 写者键：每行带 writer 且本模块 = "retry"',
++          all(isinstance(e.get('writer'), str) and e.get('writer') == 'retry' for e in ev),
++          str(sorted({e.get('writer') for e in ev})))
+     check('T9.level 全为 request', all(e['level'] == 'request' for e in ev))
+     check('T9.seq 严格单调', [e['seq'] for e in ev] == list(range(1, len(ev) + 1)),
+           str([e['seq'] for e in ev]))
+--- a/scope-check.py
++++ b/scope-check.py
+@@ -108,7 +108,24 @@
+ 
+ 
+ def main():
++    global MOD
+     as_json = '--json' in sys.argv[1:]
++    # R3-P4·P4.5（R-4）：`--ref PATH` 把被检文件从 HERE/scrape.py 换成任意文件。
++    #   用途：合流靶上**分支件**仍需逐一过同一套单槽纪律判据（test_converge.py 合流模式会
++    #   重建 converge 分支件 `refs + converge.patch + converge-f1.patch` 后再检）。判据逻辑、
++    #   ALLOWED/FORBIDDEN、退出码语义**完全不变**；被检对象由调用方显式给出（绝不静默换靶）。
++    ref_override = None
++    argv = sys.argv[1:]
++    if '--ref' in argv:
++        i = argv.index('--ref')
++        if i + 1 >= len(argv):
++            sys.stderr.write('usage: scope-check.py [--json] [--ref PATH]\n')
++            return 2
++        ref_override = Path(argv[i + 1])
++        if not ref_override.exists():
++            sys.stderr.write('scope-check: --ref 指向的文件不存在：%s\n' % ref_override)
++            return 2
++        MOD = ref_override
+     mod_sp, mod_lines = spans(MOD)
+     base_sp, base_lines = spans(BASE)
+     base_changed, mod_changed = changed_lines()
+@@ -154,6 +171,8 @@
+             same_body[name] = False
+ 
+     report = {'baseline': str(BASE), 'modified': str(MOD),
++              'ref_override': (str(ref_override) if ref_override else None),
++              'mode': ('ref' if ref_override else 'default'),
+               'changed_mod_lines': len(mod_changed), 'changed_base_lines': len(base_changed),
+               'new_defs': new_defs, 'removed_defs': gone_defs,
+               'regions': dict(sorted(regions.items(), key=lambda kv: -(kv[1]['mod'] + kv[1]['base']))),
+--- a/acceptance/R3-v2.sh
++++ b/acceptance/R3-v2.sh
+@@ -404,11 +404,21 @@
+         break
+ 
+ backoff = getattr(m, "RETRY_BACKOFF", None)
++# R-8（P4.5·v2.1）：候选版已删除乘性口径的 RETRY_JITTER_LO/HI（改为 equal jitter 的
++# RETRY_JITTER_BAND=(0.5,1.0) / RETRY_JITTER_MEAN=0.75）。**本节读数与判据数值不变**
++# （R-2 已登记「K2 口径过期」，其口径重新冻结不在 R-8 处置范围内），只把两种口径分别标注，
++# 避免读者把 [0.75,1.25] 误当成现行抖动带：现行 wait/d ∈ [0.5,1.0]，E[wait] = 0.75·d。
+ jlo = float(getattr(m, "RETRY_JITTER_LO", 0.75))
+ jhi = float(getattr(m, "RETRY_JITTER_HI", 1.25))
+-result["constants"] = {"RETRY_BACKOFF": backoff, "jitter": [jlo, jhi],
+-                       "RETRY_MAX_ATTEMPTS": getattr(m, "RETRY_MAX_ATTEMPTS", None),
+-                       "RETRY_MIN_RETRIES": getattr(m, "RETRY_MIN_RETRIES", None)}
++_band = getattr(m, "RETRY_JITTER_BAND", None)
++result["constants"] = {
++    "RETRY_BACKOFF": backoff, "jitter": [jlo, jhi],
++    "jitter_legacy_multiplicative": [jlo, jhi],
++    "jitter_band_equal": ([float(_band[0]), float(_band[1])]
++                          if isinstance(_band, (tuple, list)) and len(_band) == 2 else None),
++    "jitter_mean_over_d": getattr(m, "RETRY_JITTER_MEAN", None),
++    "RETRY_MAX_ATTEMPTS": getattr(m, "RETRY_MAX_ATTEMPTS", None),
++    "RETRY_MIN_RETRIES": getattr(m, "RETRY_MIN_RETRIES", None)}
+ if not isinstance(backoff, dict) or not backoff:
+     result["fatal"] = "缺少 RETRY_BACKOFF 表（无法判定退避包络）"
+     dump(3)
+@@ -786,7 +796,12 @@
+     "probe_all_dead=%d repair_round_enter=%d" % (ev.get("probe_all_dead", 0),
+                                                  ev.get("repair_round_enter", 0)))
+ 
+-# 契约 v2 强制字段 + 每 pid 组 seq 从 1 连续（audit-contract-v2 §1/§3）
++# 契约 v2 强制字段 + 每组 seq 从 1 连续（audit-contract-v2 §1/§3 + **§8.2 分组键 (pid,writer)**）
++#   v2.1（P4.5·KI-1）：分组键由 pid 改为 (pid, writer)。理由同 audit-verify-v2.py §8.2：
++#   同一进程内可有两个写者（scrape.py 块级 "converge" × audit.py 请求级 "retry"）各持独立
++#   计数器，本探针抽到的 C2 场景（probe_all_dead）实测就同时含两写者（converge seq=1 与
++#   retry seq=1..N）⇒ 只按 pid 分组会误判重复。
++#   **判据数值口径不变**：缺 writer 的行（v2.0 历史产物）回落 (pid,"") ⇒ 行为与改前逐项相同。
+ viol, groups, nocanon = [], {}, 0
+ for idx, r in enumerate(rows):
+     if r.get("schema") != "r3-audit-v2":
+@@ -809,15 +824,15 @@
+     if problems:
+         viol.append("row%d 缺/坏字段:%s" % (idx, ",".join(problems)))
+         continue
+-    groups.setdefault(r["pid"], []).append(r["seq"])
++    groups.setdefault((r["pid"], r.get("writer") or ""), []).append(r["seq"])
+ seqbad = []
+-for pid, seqs in groups.items():
++for (pid, w), seqs in groups.items():
+     if sorted(seqs) != list(range(1, len(seqs) + 1)):
+-        seqbad.append("pid=%s seq=%s" % (pid, sorted(seqs)[:12]))
++        seqbad.append("pid=%s writer=%s seq=%s" % (pid, w or "<missing>", sorted(seqs)[:12]))
+ chk("contract_v2_fields", bool(rows) and not viol,
+     "v2 行 %d/%d；违规 %d：%s" % (nocanon, len(rows), len(viol), viol[:4]))
+ chk("contract_v2_seq", bool(groups) and not seqbad,
+-    "pid 组 %d 个；seq 违规：%s" % (len(groups), seqbad[:3]))
++    "(pid,writer) 组 %d 个；seq 违规：%s" % (len(groups), seqbad[:3]))
+ if torn:
+     res["notes"].append("末行撕裂 %d 行（契约 §5.6 容忍 ≤1）" % torn)
+ res["levels_seen"] = sorted({r.get("level") for r in rows if r.get("level") in LEVELS})
+--- a/KNOWN-ISSUES.md
++++ b/KNOWN-ISSUES.md
+@@ -1,7 +1,12 @@
+-# r3-candidate 已知问题清单（R3p4 merge 槽随产物交付）
++# r3-candidate 已知问题清单（R3p4 merge 槽随产物交付 · **v2.1 状态表在文末**）
+ 
+ > 本清单只登记**合成候选版**在集成回归中实测到的问题，含根因归属与是否由合成引入。
+ > 完整证据见 `R3p4/merge/merge-report.md` §6/§7 与 `R3p4/merge/logs/`。
++>
++> **v2.1 增量（R3p4 · P4.5 · slot-candidate-fix，2026-09-16）**：KI-1 已按契约 §8 修复
++> （`writer` 分组键）；R-4/R-8/R-9 已处置。逐条现状与证据见文末「v2.1 状态表」，
++> 变更清单见 `lineage/v20-to-v21-changes.md`，差异见 `lineage/scrape-v2.0-to-v2.1.diff`
++> 与 `candidate-v2.1.patch`。
+ 
+ ## KI-1（HIGH · 阻塞 S4 审计链路）scrape 侧「两写者共用同一 pid 的 seq 计数器」冲突
+ 
+@@ -89,3 +94,26 @@
+ 
+ - 合成版 S4：`重复 mms 3525`、`重复叶子块 0`（治理断言 `dup_leaves_within_tolerance` **PASS**）。
+ - R3 基线 S4 读数为**完全相同的 3525** ⇒ 既有现象，非合成引入，本轮不追根因。
++
++---
++
++# v2.1 状态表（R3p4 · P4.5 · slot-candidate-fix · 2026-09-16）
++
++> 依据：`R3p4/refs/audit-contract-v2.md` **§8（v2.1 增量）** + `R3p4/verification/report.md` §6-洞 C / §7 遗留表。
++> 全部读数：`R3p4/p4p5/slot-candidate-fix/test-report.md` 与同目录 `readings/`、`logs/`。
++
++| 项 | 级别 | v2.1 处置 | 关键读数 |
++|---|---|---|---|
++| **KI-1** 两写者共用 pid 的 seq 计数器 | HIGH | **已修**（契约 §8：行加 `writer` 分组键；校验器按 `(文件,pid,writer)` 分组；缺 writer 严格模式硬违规 `writer_missing`，compat 回退 `(pid,"")`） | 修复版真实 S4：`verdict=PASS audit=PASS`，校验器 `exit 0 / canonical_pass=True`，`writer 分组 3 个 / 无 writer 分组 0 个`（`retry` 62 × `converge` 3 同 pid 5196 各自 1..N 连续、`keeper` 10） |
++| **R-4** `test_converge.py` 合流靶 3 红 | MED | **已修**（套件参数化 `--target-mode auto\|single\|merge`：合流靶上 3 条单槽不变量换为合流作用域等价判据，见 `test-report.md` §3） | 合流靶：**TOTAL PASS，失败断言 0**（原 76 PASS/3 FAIL） |
++| **R-8** 继续导出【弃用】`RETRY_JITTER_LO/HI` | LOW | **已修**：删除旧导出，改为 `RETRY_JITTER_BAND=(0.5,1.0)` / `RETRY_JITTER_MEAN=0.75`，并注明 equal jitter 的 `E[wait]=0.75·d`（相对乘性基线收紧 25%，属 retry-fatal 已知取舍）；`acceptance/R3-v2.sh` 的 K2 探针只加**口径标注**，判据数值不变（K2 口径重新冻结属 R-2） | 旧导出 `[]`；4000 抽样 ×20 格实测 `E[wait]/d = 0.7497`、`wait/d ∈ [0.5000, 1.0000]`；K2 探针读数仍 `[0.75, 1.25]`（前后一致，不改变任何判据） |
++| **R-9** 校验器把 keeper 的 `keeper_exit_observed` 记 `event_unknown` | LOW | **已修**（改读侧表 = 侵入小者）：扩展表补入 keeper 写入名 11 个；`--self-test` 增加 `keeper.event_table_aligned` 回归护栏（从 `keeper-v3.sh` 机器提取而非手抄） | 同一夹具：v2.0 校验器 `rc=1 event_unknown=1`；v2.1 校验器 `rc=0 canonical_pass=True event_unknown=0`；keeper 49 个写入名表外 **0** 个 |
++| KI-2 S1 `no_unique_loss`=2396 | MED | **未处置**（R2 并发遗留，与本轮任务无关） | 见原条目；本槽未跑 S1（红线不 kill 进程） |
++| KI-3 单槽不变量设计使然 | LOW | **已参数化**（同 R-4）：单槽靶仍走原判据 | 单槽对照（converge-f1 靶）：原判据全绿 |
++| KI-4 `test_retry.py` T9 漂移 | — | 已处置（merge）；v2.1 追加 §8 写者键护栏 | `181 PASS / 0 FAIL`（180 → 181，+1 即 §8 护栏） |
++| KI-5 keeper 侧语义冲突 | — | 已处置（merge），v2.1 在其行布局上追加 `writer:"keeper"` | 真实 S4 keeper sink：`writer=keeper` 10 行、seq 1..10 |
++| KI-6 S4 `重复 mms 3525` | 观察项 | 未处置（既有现象） | 修复版 S4 仍为 3525（与本轮无关） |
++
++**遗留（交 R4/R5）**：R-2（K2/K7/K8 判据本身不可用）、R-3（C2 侧无独立旁路）、R-5（候选版不带 runs/）、
++R-7（K9b 默认演练 r3-full）、R-10（72h 长跑 / 真实网络 / kill 注入）、R-12（ADV 计数口径反了）——
++均见 `verification/report.md` §7，本槽未处置也**不建议在未处理 R-2 之前**把 K2 当作有效判据。

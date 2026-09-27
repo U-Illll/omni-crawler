@@ -1,0 +1,484 @@
+--- R3/impl/slot-retry/scrape.py	2026-09-15 20:48:56.083027427 +0800
++++ R3p4/slot-retry-fatal/scrape.py	2026-09-16 13:53:53.005385916 +0800
+@@ -1551,19 +1551,44 @@
+ # 目标（goal-card §1 C1）：断连/超时/5xx 自动重试 ≥3 次、指数退避+抖动；每级自愈事件
+ # 写结构化审计（refs/r3-audit-schema.md：retry_scheduled / retry_exhausted / error_classified）。
+ #
+-# ① 分类学（7 类；命名与语义对齐 refs/r3-audit-schema.md，异常名单对齐 R2 的 T8
++# ① 分类学（R3-P4：11 类；命名与语义对齐 refs/r3-audit-schema.md，异常名单对齐 R2 的 T8
+ #    `_R2_NET_EXC_NAMES`）：dns / conn_reset / read_timeout / write_timeout /
+-#    server_5xx / ratelimit / other。分类**只决定退避参数与停摆归属**；「是否重试」仍按
+-#    基线集合 RETRY_STATUS_CODES 判定（= 基线 L1578 的 (400,401,403,429,500,502,503,504)
+-#    逐值相同）⇒ 默认行为不劣化现状。
+-# ② 退避：wait = min(cap, base × factor^att) × U(0.75, 1.25)，参数全部集中在 RETRY_BACKOFF。
++#    server_5xx / ratelimit / auth / client / fatal / data / other。
++#    分类**只决定退避参数与停摆归属**；「是否重试」仍按基线集合 RETRY_STATUS_CODES 判定
++#    （= 基线 L1578 的 (400,401,403,429,500,502,503,504) 逐值相同）⇒ 默认行为不劣化现状。
++#    ------- R3-P4 的三处归因修正（出处：crit-correct R-1/R-4/R-5 + crit-adv a2/a1c）-------
++#    · R-1 匹配次序：**具体信号先于泛化信号**。连接超时的类型/特征（ConnectTimeout /
++#      ConnectTimeoutError / 'connect timeout'）必须先于泛化的 'timed out'/'timeout' 读超时
++#      特征命中，否则 urllib3 的 ConnectTimeoutError、MaxRetryError（消息形如
++#      'Connection to h timed out. (connect timeout=10)'）会被误吸成 read_timeout
++#      ⇒ 错退避族（1s/15s vs 2s/30s）+ 错停摆归属（sleep vs cooldown）。
++#      反面约束（不得回退）：`ConnectionError('…Read timed out.')` 仍须判 read_timeout，
++#      因此不能简单「类型表一律优先」——见 _retry_class_of_exc 的优先级注释。
++#    · R-4/R-B6：fatal（404/410/其余确定性 4xx/3xx）**完全不喂限速器**（不调 note_status）
++#      ⇒ 不发散 AIMD 地板、不计 err_streak（v2 语义；legacy 保留基线调用，见 ⑥）。
++#    · a2 归因分离：HTTP 400 从 ratelimit 拆出为 **client**。理由：本站 400 既是限流码
++#      （R2/rate-profile §1：8.5 req/s → 4×400）也可能是我们自己的查询构造错误，单条目
++#      证据不足以判定「服务端级限流」，因此 **不走全局 cooldown**（owner='sleep'，只停自己），
++#      但仍按「每个逻辑请求一次」喂限速器的 rlimit 通道 ⇒ 跨请求的 400 风暴依然会被 AIMD
++#      地板响应（B3 保护不被拆掉）；429 语义不变（无歧义 ⇒ class=ratelimit + 全局 cooldown）。
++# ② 退避：d = min(cap, base × factor^att)；wait = d/2 + U(0, d/2)（**equal jitter**，
++#    survey-retry §R-B2 的原式）。两条结构性断言（R-B2 ①④，均有单测）：
++#      · max(wait) ≤ cap（对任意抖动抽样成立：wait ≤ d ≤ cap）；
++#      · 首档 wait ≤ base（att=0 时 d = min(cap, base)）。
++#    单调性（R-2）：band_k = [d_k/2, d_k]；factor ≥ 2 ⇒ 在**未触及 cap 的增长区**
++#    band_{k+1} 下界 = d_k = band_k 上界 ⇒ 相邻档位区间不重叠 ⇒ 该区间的退避序列（含期望）
++#    非递减；进入 cap 后档位期望恒为 0.75·cap（上界恒为 cap）⇒ 期望非递减，唯一次抽样仍
++#    可能因抖动回落（这是抖动在饱和区的固有代价，不再是"抖动跨区 > factor"的结构缺陷）。
++#    factor<1.667 的类已按 R-2 上调到 2.0（否则抖动区间比 > factor 会结构性破坏单调）。
+ # ③ 停摆归属（消除 cooldown/sleep 双计，survey-throttle §B5 的明确要求）：
+ #      · owner='cooldown'（ratelimit / auth / dns / conn_reset）：只 `LIMITER.cooldown(wait)`，
+ #        真实等待由**下一次 LIMITER.acquire()** 承担 ⇒ 日志与审计里的 wait_s 与实际停摆
+ #        一一对应，且全局限速器是唯一停摆所有者；
+-#      · owner='sleep'（read_timeout / write_timeout / server_5xx / other）：只线程内
++#      · owner='sleep'（read_timeout / write_timeout / server_5xx / client / other）：只线程内
+ #        `time.sleep(wait)`，全局节拍继续由 LIMITER.acquire() + throttle v2 的 note_status
+-#        反馈负责，不额外全局停摆。
++#        反馈负责，不额外全局停摆（crit-adv a2：单条目 400 不得冻结全部 worker）；
++#      · owner='none'（fatal / data）：确定性失败 ⇒ **不重试**，因此不产生任何停摆，
++#        该值只表意（不存在调用点）。
+ #    基线的异常路径是 `cooldown(10)` **加** `sleep(5+5·att)`：两处计同一个窗口，实测多停
+ #    5s（test-report T6 的 legacy 对照读数）；新路径每个错误**恰好一个**停摆归属。
+ # ④ 与 throttle v2 的分工：throttle v2 拥有**长期节拍**（间隔 / AIMD 地板 / 1s 窗口上限，
+@@ -1571,7 +1596,16 @@
+ #    即时停摆**。THROTTLE_COOLDOWN=1.0 只是限速器内部小缓冲（未改动），不构成第二份退避。
+ # ⑤ 预算：C1 要求「重试 ≥3 次」⇒ v2 下尝试次数下限 1+RETRY_MIN_RETRIES = 4；默认
+ #    retries=6（= 5 次重试，与基线同值）。
+-# ⑥ 开关：SCRAPE_RETRY=v2（默认）/ legacy（逐行为等价基线：cooldown+sleep 双计、无审计事件）。
++#    R-2 语义澄清（crit-correct R-2 的第三个反例）：**RETRY_MAX_ATTEMPTS 是硬上限**，
++#    任何来源（调用方 retries 或 ENFORCE_MIN 的防御性下限）都不得突破它；
++#    ENFORCE_MIN 只把**低于下限**的调用方取值抬到 min(1+RETRY_MIN_RETRIES, MAX_ATTEMPTS)。
++#    于是 `SCRAPE_RETRY_MAX_ATTEMPTS=2` ⇒ 真的只发 2 次（并打印一条告警说明 C1 被显式
++#    降级），不再"静默覆盖用户硬上限"。见 _retry_attempt_budget()。
++# ⑥ 开关：SCRAPE_RETRY=v2（默认）/ legacy（逐行为等价基线：cooldown+sleep 双计）。
++#    R-6 修正：legacy 模式**不写任何审计事件**（含 fatal 的 error_classified 与预算耗尽的
++#    retry_exhausted——R3-P4 前它们写在 mode 判断之外，与"逐行为等价"的声明冲突）；
++#    legacy 也保留基线的 note_status 调用（含 fatal 分支）⇒ 回滚开关确实回到基线行为，
++#    该差异是**有意**的（v2 才是 R-B6 的新语义），单测 T13 双向断言。
+ # ===========================================================================
+ _R3_RUN_ID = os.environ.get('SCRAPE_RUN_ID') or ('boot-' + datetime.now().strftime('%Y%m%dT%H%M%S'))
+ 
+@@ -1590,42 +1624,57 @@
+ 
+ RETRY_MODE = _r3_retry_mode()                 # 'v2' | 'legacy'
+ RETRY_MIN_RETRIES = 3                         # C1 硬指标：断连/超时/5xx 至少重试 3 次
+-RETRY_ENFORCE_MIN = _env_num('SCRAPE_RETRY_ENFORCE_MIN', 1, int) == 1   # v2 下强制满足 C1
+-RETRY_MAX_ATTEMPTS = _env_num('SCRAPE_RETRY_MAX_ATTEMPTS', 12, int)     # 尝试次数硬上限（防御性）
+-RETRY_JITTER_LO = 0.75                        # 抖动乘子下界（Crawl4AI async_dispatcher 同源取值）
+-RETRY_JITTER_HI = 1.25                        # 抖动乘子上界
+-# 每类错误的指数退避参数：class -> (base_s, factor, cap_s)；wait = min(cap, base×factor^att)×抖动
++RETRY_ENFORCE_MIN = _env_num('SCRAPE_RETRY_ENFORCE_MIN', 1, int) == 1   # v2 下补齐 C1 下限
++RETRY_MAX_ATTEMPTS = _env_num('SCRAPE_RETRY_MAX_ATTEMPTS', 12, int)     # 尝试次数**硬上限**（不可被下限突破）
++# R-2：抖动形式由「乘性 U(0.75,1.25)」改为 **equal jitter**（见 _retry_wait_plan）。
++# 这两个常量保留为**历史读数口径**（旧报告/对照脚本引用），不再参与退避计算。
++RETRY_JITTER_LO = 0.75                        # 【弃用】旧乘性抖动下界（保留仅为兼容引用）
++RETRY_JITTER_HI = 1.25                        # 【弃用】旧乘性抖动上界（保留仅为兼容引用）
++# 每类错误的指数退避参数：class -> (base_s, factor, cap_s)
++#   d = min(cap, base × factor^att)；wait = d/2 + U(0, d/2)（equal jitter）
+ RETRY_BACKOFF = {
+     'dns':           (2.0, 2.0, 30.0),        # 解析失败：按"网络整体不可用"处理（全局停摆）
+     'conn_reset':    (2.0, 2.0, 30.0),        # 重置/拒绝/中断/建立超时/SSL：同上
+     'read_timeout':  (1.0, 2.0, 15.0),        # 读超时：本次已耗掉请求超时，退避可短
+     'write_timeout': (1.0, 2.0, 15.0),        # 写超时：同上
+     'server_5xx':    (5.0, 2.0, 60.0),        # 服务端故障：保守（不等于基线 15+10·att 的侵略性）
+-    'ratelimit':     (15.0, 1.5, 60.0),       # 429/400：基线首值 15s，改指数 + 抖动
+-    'auth':          (15.0, 1.5, 60.0),       # 401/403：基线也重试，沿用保守档
+-    'other':         (2.0, 2.0, 20.0),        # 其余异常（含 200 但 JSON 解析失败）：基线也重试
++    'ratelimit':     (15.0, 2.0, 60.0),       # 429（无歧义的限流）：factor 1.5→2.0（R-2 单调性）
++    'auth':          (15.0, 2.0, 60.0),       # 401/403：基线也重试，沿用保守档（factor 同上）
++    'client':        (2.0, 2.0, 20.0),        # 400：单条目责任，线程内退避（不冻结全局）
++    'other':         (2.0, 2.0, 20.0),        # 其余异常（v2 下 data 类已单独 fail-fast）
++    'fatal':         (0.0, 1.0, 0.0),         # 确定性失败：**不重试** ⇒ 参数只表意
++    'data':          (0.0, 1.0, 0.0),         # 数据类失败：**不重试** ⇒ 参数只表意
+ }
+-# 停摆归属：'cooldown' = 全局限速器唯一停摆（不 sleep）；'sleep' = 仅线程内退避（不 cooldown）
++# 停摆归属：'cooldown' = 全局限速器唯一停摆（不 sleep）；'sleep' = 仅线程内退避（不 cooldown）；
++#           'none' = 不重试、无停摆（只表意）
+ RETRY_STALL_OWNER = {
+     'ratelimit': 'cooldown', 'auth': 'cooldown', 'dns': 'cooldown', 'conn_reset': 'cooldown',
+-    'read_timeout': 'sleep', 'write_timeout': 'sleep', 'server_5xx': 'sleep', 'other': 'sleep',
++    'read_timeout': 'sleep', 'write_timeout': 'sleep', 'server_5xx': 'sleep',
++    'client': 'sleep', 'other': 'sleep', 'fatal': 'none', 'data': 'none',
+ }
+ RETRY_STATUS_CODES = (400, 401, 403, 429, 500, 502, 503, 504)   # = 基线 L1578 逐值相同
+-RETRY_RATELIMIT_CODES = (400, 429)            # 与 throttle v2 的 'rlimit' 类同义（400 是本站限流码）
++RETRY_RATELIMIT_CODES = (429,)                # R3-P4：400 已拆出（见 RETRY_CLIENT_CODES）
++RETRY_CLIENT_CODES = (400,)                   # 400：歧义码（本站限流码 or 查询构造错）⇒ client 类
++RETRY_FATAL_CODES = (404, 410)                # 确定性 fatal（R-B1 矩阵：404/410/其余 4xx/3xx）
+ RETRY_AUTH_CODES = (401, 403)
+ RETRY_LEGACY_STATUS = (15, 10)              # legacy: wait = 15 + 10·att（基线 L1579；**int** ⇒ 日志逐字节相同）
+ RETRY_LEGACY_EXC = (10, 5, 5)                 # legacy: cooldown(10) + sleep(5 + 5·att)（基线 L1601-1602；int 同上）
+ RETRY_AUDIT_CLASSIFY_EVERY = max(1, _env_num('SCRAPE_RETRY_CLASSIFY_EVERY', 1, int))  # 采样比（≥2 时降频）
+ 
+-# 异常 → 类别的文本特征（顺序敏感：dns → write → read → reset → other）
++# 异常 → 类别的判据表。**优先级从具体到泛化**（R-1）：类型表（含 MRO 名）与"具体文本特征"
++# 都排在泛化文本特征（'timed out'/'timeout'）之前。
+ _RETRY_DNS_TYPES = ('NameResolutionError', 'gaierror')
+ _RETRY_DNS_MARKERS = ('name resolution', 'name or service not known', 'nodename nor servname',
+                       'getaddrinfo', 'temporary failure in name resolution',
+                       'no address associated', 'failed to resolve', 'name does not resolve')
++# 建立连接超时：**必须**先于泛化 timeout 读特征（R-1 的核心修正）
++_RETRY_CONNECT_TIMEOUT_TYPES = ('ConnectTimeout', 'ConnectTimeoutError')
++_RETRY_CONNECT_TIMEOUT_MARKERS = ('connect timeout', 'connection timeout', 'connect timed out',
++                                  'timeout during connect', 'timed out during connect')
+ _RETRY_WRITE_MARKERS = ('write timed out', 'writetimeout', 'write timeout')
++_RETRY_WRITE_TYPES = ('WriteTimeout', 'WriteTimeoutError')
+ _RETRY_READ_MARKERS = ('read timed out', 'readtimeout', 'read timeout', 'timed out', 'timeout')
+-_RETRY_READ_TYPES = ('ReadTimeout', 'Timeout', 'TimeoutError', 'timeout')
+-_RETRY_CONNECT_TIMEOUT_TYPES = ('ConnectTimeout',)     # 建立连接超时 ⇒ 归连接类
++_RETRY_READ_TYPES = ('ReadTimeout', 'ReadTimeoutError', 'Timeout', 'TimeoutError', 'timeout')
+ _RETRY_RESET_TYPES = ('ConnectionError', 'ConnectionResetError', 'ConnectionAbortedError',
+                       'RemoteDisconnected', 'ProtocolError', 'SSLError', 'SSLEOFError',
+                       'ProxyError', 'NewConnectionError', 'MaxRetryError', 'IncompleteRead',
+@@ -1634,69 +1683,180 @@
+                         'connection error', 'remote end closed', 'remote disconnected',
+                         'eof occurred', 'bad status line', 'tunnel connection failed',
+                         'broken pipe', 'ssl', 'certificate', 'proxy')
++# 数据类（确定性失败：同一输入的两次尝试之间输入不变 ⇒ 不可重试；R-B1/R-B7）
++#   含 200-but-bad-body 的 `r.json()` 失败（JSONDecodeError ⊂ ValueError）与结构错
++#   （KeyError/TypeError/AttributeError —— 体不符合预期时由解析/取字段路径抛出）。
++_RETRY_DATA_TYPES = ('JSONDecodeError', 'InvalidJSONError', 'ContentDecodingError',
++                     'UnicodeDecodeError', 'ValueError', 'KeyError', 'IndexError',
++                     'TypeError', 'AttributeError')
+ 
+ 
+-def _retry_class_of_status(code):
+-    """HTTP 状态码 → 类别（分类学；与「是否重试」解耦）。"""
++def _retry_exc_names(e):
++    """异常的类型名集合：自身 + 全部 MRO 基类名（兼容子类，不 import requests/urllib3）。"""
++    names = set()
+     try:
+-        c = int(code)
+-    except (TypeError, ValueError):
+-        return 'other'
+-    if c in RETRY_RATELIMIT_CODES:
+-        return 'ratelimit'
+-    if c in RETRY_AUTH_CODES:
+-        return 'auth'
+-    if 500 <= c <= 599:
+-        return 'server_5xx'
+-    if 400 <= c <= 499:
+-        return 'other'
+-    return 'other'
++        for k in type(e).__mro__:
++            names.add(k.__name__)
++    except Exception:
++        names.add(type(e).__name__)
++    return names
+ 
+ 
+-def _retry_class_of_exc(e):
+-    """异常 → 类别。判据 = 异常类名 + 消息文本特征（顺序敏感，见常量表）。"""
+-    name = type(e).__name__
+-    try:
+-        msg = str(e)[:400].lower()
+-    except Exception:
+-        msg = ''
+-    for t in _RETRY_DNS_TYPES:
+-        if name == t:
++def _retry_cls_of_names(names, msg):
++    """(类型名集合, 小写消息) → 类别。**唯一**的分类判据函数（顺序 = 优先级，R-1）。"""
++    for t in _RETRY_DNS_TYPES:                        # ① DNS 类型
++        if t in names:
+             return 'dns'
+-    for m in _RETRY_DNS_MARKERS:
++    for m in _RETRY_DNS_MARKERS:                      # ② DNS 特征
+         if m in msg:
+             return 'dns'
+-    for t in _RETRY_CONNECT_TIMEOUT_TYPES:
+-        if name == t:
++    for t in _RETRY_CONNECT_TIMEOUT_TYPES:            # ③ 建立连接超时：类型先于泛化 timeout 特征
++        if t in names:
++            return 'conn_reset'
++    for m in _RETRY_CONNECT_TIMEOUT_MARKERS:          # ④ 建立连接超时：具体文本特征
++        if m in msg:
+             return 'conn_reset'
+-    for m in _RETRY_WRITE_MARKERS:
++    for t in _RETRY_DATA_TYPES:                       # ⑤ 数据类（确定性）先于各类网络特征
++        if t in names:
++            return 'data'
++    for m in _RETRY_WRITE_MARKERS:                    # ⑥ 写超时特征
+         if m in msg:
+             return 'write_timeout'
+-    for m in _RETRY_READ_MARKERS:
++    for t in _RETRY_WRITE_TYPES:
++        if t in names:
++            return 'write_timeout'
++    for m in _RETRY_READ_MARKERS:                     # ⑦ 读超时特征（泛化 'timed out' 在此被兜住）
+         if m in msg:
+             return 'read_timeout'
+-    for t in _RETRY_READ_TYPES:
+-        if name == t:
++    for t in _RETRY_READ_TYPES:                       # ⑧ 读超时类型
++        if t in names:
+             return 'read_timeout'
+-    for t in _RETRY_RESET_TYPES:
+-        if name == t:
++    for t in _RETRY_RESET_TYPES:                      # ⑨ 连接复位类型（含 MaxRetryError/ProxyError/SSL）
++        if t in names:
+             return 'conn_reset'
+-    for m in _RETRY_RESET_MARKERS:
++    for m in _RETRY_RESET_MARKERS:                    # ⑩ 连接复位特征
+         if m in msg:
+             return 'conn_reset'
+     return 'other'
+ 
+ 
+-def _retry_wait_plan(cls, att):
+-    """一次退避的 (wait_s, owner)：退避时长与停摆归属的**唯一**来源。"""
++def _retry_class_of_status(code):
++    """HTTP 状态码 → 类别（分类学；与「是否重试」解耦）。
++
++    R3-P4：400 拆出为 `client`（歧义码，不冻结全局）；404/410 与其余确定性 4xx/3xx 归 `fatal`。
++    """
++    try:
++        c = int(code)
++    except (TypeError, ValueError):
++        return 'other'
++    if c in RETRY_RATELIMIT_CODES:          # 429：无歧义的限流
++        return 'ratelimit'
++    if c in RETRY_CLIENT_CODES:             # 400：歧义码 ⇒ client（单条目责任）
++        return 'client'
++    if c in RETRY_AUTH_CODES:
++        return 'auth'
++    if 500 <= c <= 599:
++        return 'server_5xx'
++    if c in RETRY_FATAL_CODES:              # 404/410：确定性 fatal
++        return 'fatal'
++    if 400 <= c <= 499:                     # 其余 4xx：确定性（不在重试集合内）
++        return 'fatal'
++    if 300 <= c <= 399:                     # 3xx：基线不重试 ⇒ fatal
++        return 'fatal'
++    return 'other'
++
++
++def _retry_class_of_exc(e):
++    """异常 → 类别。判据优先级：**具体信号 > 泛化信号**（R-1 修正的核心）。
++
++    判据链（逐层，命中即返回）：
++      ① 自身类型名/MRO 名 + 消息文本 → _retry_cls_of_names（顺序 = 优先级）
++      ② 若仍为 'other'：**下钻 cause 链**（`__cause__` / `__context__` / args 里的异常对象）
++         —— 真实 requests/urllib3 形态（`ConnectionError(MaxRetryError(ConnectTimeoutError))`）
++         在裸消息里可能不含任何特征，但 cause 对象带着精确类型。
++    该结构保证两条反面约束同时成立：
++      · `ConnectionError('…Read timed out.')` → read_timeout（具体读特征命中，不被类型表抢走）；
++      · `ConnectionError('…(Caused by ConnectTimeoutError(…connect timeout=10))')` /
++        `MaxRetryError(reason='Connection to h timed out. (connect timeout=10)')` → conn_reset。
++    """
++    seen = set()
++    cur = e
++    depth = 0
++    while cur is not None and depth < 5 and id(cur) not in seen:
++        seen.add(id(cur))
++        depth += 1
++        try:
++            msg = str(cur)[:400].lower()
++        except Exception:
++            msg = ''
++        cls = _retry_cls_of_names(_retry_exc_names(cur), msg)
++        if cls != 'other':
++            return cls
++        # 下钻：__cause__（raise ... from）优先于 __context__（隐式链），再退到 args 里的异常
++        nxt = getattr(cur, '__cause__', None) or getattr(cur, '__context__', None)
++        if nxt is None:
++            for a in getattr(cur, 'args', ()) or ():
++                if isinstance(a, BaseException):
++                    nxt = a
++                    break
++        cur = nxt if nxt is not cur else None
++    return 'other'
++
++
++def _retry_wait_band(cls, att):
++    """退避档位的 (lo, hi)：equal jitter 下 wait ∈ [d/2, d]，d = min(cap, base·factor^att)。
++
++    这是 _retry_wait_plan 的**解析上界**，供单测断言 R-B2 的两条性质（cap / 首档 / 单调）。
++    """
+     base, factor, cap = RETRY_BACKOFF.get(cls, RETRY_BACKOFF['other'])
+-    raw = float(base) * (float(factor) ** int(att))
++    d = float(base) * (float(factor) ** int(att))
+     if cap:
+-        raw = min(raw, float(cap))
+-    wait = raw * random.uniform(RETRY_JITTER_LO, RETRY_JITTER_HI)
++        d = min(d, float(cap))
++    return d / 2.0, d
++
++
++def _retry_wait_plan(cls, att):
++    """一次退避的 (wait_s, owner)：退避时长与停摆归属的**唯一**来源。
++
++    公式（equal jitter，survey-retry §R-B2）：d = min(cap, base·factor^att)；
++    wait = d/2 + U(0, d/2)。结构性性质（均有单测）：
++      · wait ≤ d ≤ cap ⇒ **max(wait) ≤ CAP**（对任意抖动抽样成立）；
++      · att=0 时 d = min(cap, base) ⇒ **首档 ≤ BASE**；
++      · 增长区（d 未饱和）内 factor≥2 ⇒ band_k=[d_k/2,d_k] 与 band_{k+1} 不重叠 ⇒ 序列非递减。
++    """
++    lo, hi = _retry_wait_band(cls, att)
++    wait = lo + random.uniform(0.0, max(0.0, hi - lo))
+     return wait, RETRY_STALL_OWNER.get(cls, 'sleep')
+ 
+ 
++def _retry_attempt_budget(retries):
++    """尝试次数预算：`RETRY_MAX_ATTEMPTS` 是**硬上限**，`RETRY_ENFORCE_MIN` 只在下方补齐。
++
++    v2：attempts = min(max(1, retries), MAX_ATTEMPTS)，再在 ENFORCE_MIN 打开时抬到
++        min(1+RETRY_MIN_RETRIES, MAX_ATTEMPTS)（C1 的「≥3 次重试」）。
++    语义澄清（crit-correct R-2）：防御性下限**不得**静默突破用户显式设置的硬上限；
++        若用户把上限压到 1+RETRY_MIN_RETRIES 之下，C1 即为显式降级，这里打印一条告警。
++    legacy：与基线逐行为等价 —— 直接用调用方的 retries（不做任何 clamp）。
++    """
++    try:
++        n = int(retries)
++    except (TypeError, ValueError):
++        n = 6
++    n = max(1, n)
++    if RETRY_MODE != 'v2':
++        return n
++    hard = max(1, int(RETRY_MAX_ATTEMPTS))
++    n = min(n, hard)
++    if RETRY_ENFORCE_MIN:
++        floor = 1 + int(RETRY_MIN_RETRIES)
++        if n < min(floor, hard):
++            n = min(floor, hard)
++        elif hard < floor:
++            log(f"[retry] 告警：SCRAPE_RETRY_MAX_ATTEMPTS={hard} < C1 下限 {floor} ⇒ "
++                f"尝试次数按硬上限执行，C1「重试≥{RETRY_MIN_RETRIES} 次」被显式降级")
++    return n
++
++
+ def _retry_apply_wait(wait, owner):
+     """施加退避（**单一**停摆归属）。返回实际生效方式：'cooldown' | 'sleep'。
+ 
+@@ -1784,17 +1944,9 @@
+     url = HOST + "/primaws/rest/pub/pnxs"
+     # R2 v2: 本次请求的类别（延迟劣化基线按类别隔离，见 RateLimiter 文档）
+     _kind = 'bulk' if limit >= THROTTLE_BULK_LIMIT else 'light'
+-    # R3: `retries` 语义与基线同名（= 尝试次数，非重试次数）。v2 下强制 C1 下限
+-    #     （至少 1+RETRY_MIN_RETRIES 次尝试 ⇒ 断连/超时/5xx 至少重试 3 次）。
+-    try:
+-        _attempts = int(retries)
+-    except (TypeError, ValueError):
+-        _attempts = 6
+-    _attempts = max(1, _attempts)
+-    if RETRY_MODE == 'v2':
+-        _attempts = min(_attempts, max(1, int(RETRY_MAX_ATTEMPTS)))
+-        if RETRY_ENFORCE_MIN:
+-            _attempts = max(_attempts, 1 + int(RETRY_MIN_RETRIES))
++    # R3: `retries` 语义与基线同名（= 尝试次数，非重试次数）。v2 下按 C1 下限补齐，
++    #     但 RETRY_MAX_ATTEMPTS 是硬上限（R-2：防御性下限不得静默突破用户上限）。
++    _attempts = _retry_attempt_budget(retries)
+     _last_err = None
+     for att in range(_attempts):
+         LIMITER.acquire()
+@@ -1812,22 +1964,49 @@
+                             timeout=60)
+             if r.status_code == 200:
+                 _lat = time.time() - t0
++                # 200 是**成功的 HTTP 交换**：延迟/干净样本照旧喂给 throttle（它不是数据类失败）
+                 try:
+                     LIMITER.note_status(200, _lat, kind=_kind, issued_ts=t0)
+                 except Exception:
+                     pass
+-                return r.json()
++                if RETRY_MODE == 'legacy':
++                    # 基线逐行为等价：解析异常落进外层泛 except 的 legacy 分支（基线也重试）
++                    return r.json()
++                # ---- R-B7：体解析/结构不符合预期 = 数据类**确定性**失败 ----
++                # 单独 catch ⇒ 直接失败返回：不重试、不喂控制器、一次尝试即结束
++                # （判据用 Crawlee 的话：同一输入在两次尝试之间不会变 ⇒ 不可重试）。
++                try:
++                    _body = r.json()
++                except Exception as _de:
++                    _dc = _retry_class_of_exc(_de)
++                    if _dc == 'other':
++                        _dc = 'data'
++                    log(f"    DATA[{_dc}] {type(_de).__name__}: {str(_de)[:60]} q={q[:38]!r} ⇒ 直接失败")
++                    _retry_audit_classified(_dc, 'drop', status=200, exc=type(_de).__name__)
++                    return None
++                if not isinstance(_body, dict) or not isinstance(_body.get('info'), dict):
++                    log(f"    DATA[data] 200 但体结构不合预期（{type(_body).__name__}）"
++                        f" q={q[:38]!r} ⇒ 直接失败")
++                    _retry_audit_classified('data', 'drop', status=200,
++                                            exc='MalformedBody')
++                    return None
++                return _body
+             # ---- 非 200：分类 → （重试集合内）退避重试 /（集合外）致命返回 None ----
+             _cls = _retry_class_of_status(r.status_code)
+             _lat = time.time() - t0
+             if r.status_code not in RETRY_STATUS_CODES:
+                 # 基线语义（L1588-1593）：不在重试集合内的状态码 = 致命，不重试、返回 None
+                 log(f"    HTTP {r.status_code} fatal q={q[:60]!r}")
+-                try:
+-                    LIMITER.note_status(r.status_code, _lat, kind=_kind, issued_ts=t0)
+-                except Exception:
+-                    pass
+-                _retry_audit_classified(_cls, 'fatal', status=r.status_code)
++                # R-B6（crit-correct R-4/H4）：fatal 是**确定性**失败，不喂限速器
++                # （不发散 AIMD 地板 0.2→1.2、不计 err_streak、不进观测窗口）。
++                # legacy 保留基线调用 ⇒ 回滚开关确实回到基线行为。
++                if RETRY_MODE == 'legacy':
++                    try:
++                        LIMITER.note_status(r.status_code, _lat, kind=_kind, issued_ts=t0)
++                    except Exception:
++                        pass
++                else:
++                    _retry_audit_classified(_cls, 'fatal', status=r.status_code)
+                 return None
+             if RETRY_MODE == 'legacy':
+                 # ---- 基线逐行为等价（L1578-1587）：cooldown(wait) + sleep(wait) ----
+@@ -1841,10 +2020,15 @@
+                 time.sleep(_wait)
+                 _last_err = f"HTTP {r.status_code}"
+                 continue
+-            try:
+-                LIMITER.note_status(r.status_code, _lat, kind=_kind, issued_ts=t0)
+-            except Exception:
+-                pass
++            # a2 归因分离：400（client）**每个逻辑请求只喂一次**限速器 —— 同一查询重复 400
++            # 不是「服务端整体水位」的新证据（否则单个毒查询把全局 AIMD 地板顶到上限）；
++            # 跨请求的重复 400 仍会逐次推动地板 ⇒ 真·服务端限流依然被响应。
++            # 429 等其它可重试类每次尝试都喂（原语义不变）。
++            if _cls != 'client' or att == 0:
++                try:
++                    LIMITER.note_status(r.status_code, _lat, kind=_kind, issued_ts=t0)
++                except Exception:
++                    pass
+             _last_err = f"HTTP {r.status_code}"
+             _more = (att + 1) < _attempts
+             _retry_audit_classified(_cls, 'retry' if _more else 'exhausted',
+@@ -1874,6 +2058,11 @@
+             _ename = type(e).__name__
+             _emsg = str(e)[:120]
+             log(f"    EXC[{_cls}] {_ename}: {str(e)[:60]} q={q[:38]!r}")
++            if _cls == 'data':
++                # R-B7 兜底：数据类（体解析/结构错，含从 SESSION.get 内部抛出的解析异常）
++                # 是**确定性**失败 ⇒ 不重试、不喂控制器、一次尝试即失败返回。
++                _retry_audit_classified('data', 'drop', exc=_ename)
++                return None
+             try:
+                 LIMITER.note_status(None, time.time() - t0, exc=_ename,
+                                     kind=_kind, issued_ts=t0)
+@@ -1891,7 +2080,10 @@
+             _retry_apply_wait(_wait, _owner)
+             continue
+     log(f"    请求最终失败 q={q[:50]!r}")
+-    _retry_audit_exhausted(_attempts, q, _last_err)
++    if RETRY_MODE != 'legacy':
++        # R-6：legacy 分支不在循环内写任何事件（含 fatal 的 error_classified），
++        # 预算耗尽事件同样只属于 v2 —— 否则"legacy 逐行为等价基线 + 无审计事件"不成立。
++        _retry_audit_exhausted(_attempts, q, _last_err)
+     return None
+ 
+ def get_total(prefix, sort=None):

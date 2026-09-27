@@ -1,0 +1,412 @@
+--- R3/impl/slot-converge/scrape.py	2026-09-16 10:46:02.477944586 +0800
++++ R3p4/slot-converge-f1/scrape.py	2026-09-16 14:57:48.085217444 +0800
+@@ -1035,8 +1035,10 @@
+                 recorded_count(p) >= (total - leaf_tol(total)) and recorded_count(p) > 0:
+             _tolerance_mark(prog, p, recorded_count(p), total, 'gap-resolved')
+             resolved += 1
++            _keep_resolved_gap(prog, g, 'records-covered-by-reconcile')   # L2：留档，不静默消失
+             _recovery_note(prog, 'gap-resolved', p,
+-                           f'records 反查 {recorded_count(p)}/{total}，缺口已在容差内，从 gaps 移除')
++                           f'records 反查 {recorded_count(p)}/{total}，缺口已在容差内，'
++                           f'从 gaps 移除（已留档 resolved_gaps[]）')
+             continue
+         new_gaps.append(g)
+     prog['gaps'] = new_gaps
+@@ -1860,6 +1862,19 @@
+ GAP_REPAIR_MAX = int(_env_num('SCRAPE_GAP_REPAIR_MAX', 2, int))          # 单缺口进修复轮次数上限
+ MAX_ROUNDS = int(_env_num('SCRAPE_MAX_ROUNDS', 12, int))                 # 主循环轮数上限
+ 
++# ---- 未定论条目（条目 total 解析失败 / 条目异常）的尝试预算（R3p4·P4-A：C-1·C-2·C-3）----
++#   F1/F2 的另一扇门：条目级 total 解析失败（None 或 200-缺-info 的 KeyError）此前在
++#   并发路径无限回队尾（活锁：进程永不退出、永不写裁决），在串行路径静默 pop 丢弃
++#   （子树丢失 + exit 0 假收敛）。统一语义：
++#     ①预算内 ⇒ 重试轮（带延迟重排，不丢子树）；
++#     ②预算耗尽 ⇒ 块级降级记账（登记未决缺口 + 审计 + 进修复轮）⇒ 收敛判据拒绝 exit 0；
++#   进程一定有界退出（rc=3 未收敛）。
++TOTAL_NONE_RETRY_MAX = int(_env_num('SCRAPE_TOTAL_NONE_RETRY', 2, int))    # 条目 total 未定论重试上限
++ITEM_EXC_RETRY_MAX = int(_env_num('SCRAPE_ITEM_EXC_RETRY', 2, int))        # 并发条目异常回队尾上限
++ITEM_EXC_DELAY_S = float(_env_num('SCRAPE_ITEM_EXC_DELAY_S', 1.0, float))  # 回队尾延迟（基线 1.0s）
++UNDETERMINED_LEDGER_MAX = int(_env_num('SCRAPE_UNDET_LEDGER_MAX', 200, int))   # 未定论账本上限
++RESOLVED_GAPS_KEEP = int(_env_num('SCRAPE_RESOLVED_GAPS_KEEP', 200, int))      # 已消解缺口留档上限
++
+ # ---- 停滞判据（F5）参数 ---------------------------------------------------
+ STALL_PROGRESS_AGE_S = float(_env_num('SCRAPE_STALL_AGE_S', 900.0, float))     # 审计阈值
+ STALL_STOP_AGE_S = float(_env_num('SCRAPE_STALL_STOP_AGE_S', 1800.0, float))   # 自停阈值
+@@ -2269,6 +2284,113 @@
+ 
+ 
+ # ---------------------------------------------------------------------------
++# R3p4·P4-A —— 「条目级未定论」的统一降级记账（C-1 / C-2 / C-3 的收敛残留门闭环）
++#
++#   缺陷面（crit-correct §三 C-1/C-2/C-3，均有实跑读数）：
++#     · 并发 `_conc_run_item` 用**裸** get_total ⇒ 200-缺-info 的 KeyError 穿到 _conc_worker，
++#       `q.put_tail(item, 1.0)` **无尝试预算** ⇒ 无限回队尾活锁（25s 内 25 次，进程永不退出）；
++#     · 串行 `_serial_process_queue` 用 _safe_get_total ⇒ None ⇒ `todo.pop(0)` 静默跳过
++#       ⇒ rc=0 + 0 条记录 + 打印「全部完成」+ gaps=0 = **假收敛**（基线是响亮的 rc=1 崩溃）；
++#     · 两条路径的失败随后都被 exit 0 盖章 `decided=done`（机器判据反向背书）。
++#
++#   统一语义（**总原则**：任何「单点失败导致子树静默丢失」都必须登记且影响裁决）：
++#     ① 预算内（< TOTAL_NONE_RETRY_MAX）：重试轮 —— 条目带计数延迟重排，不丢子树；
++#     ② 预算耗尽：块级降级记账 —— 登记未决缺口（gaps[]，type='undetermined'）+ recovery 账本
++#        + 审计（契约扩展表事件 probe_incomplete{scope:'item-total'}）⇒ 进修复轮；
++#     ③ 修复轮：重新探测 total（可得 ⇒ 回队重排重跑子树；records 已覆盖 ⇒ 消解留档）；
++#        预算耗尽仍不可得 ⇒ 缺口标 terminal ⇒ 收敛判据判「未收敛」exit 3。
++#
++#   审计事件名一律取自 R3p4/refs/audit-contract-v2.md §2（probe_retry/probe_incomplete 均在
++#   扩展表内；retry_scheduled/retry_exhausted/error_classified 在核心表内），不新造表外名。
++# ---------------------------------------------------------------------------
++def _find_undetermined_gap(prog, prefix):
++    """该 prefix 已登记的未消解「未定论」缺口（跨 pass/跨进程复用，避免重复登记）。"""
++    for g in (prog.get('gaps') or []):
++        if g.get('p') == prefix and g.get('type') == 'undetermined' and not g.get('resolved'):
++            return g
++    return None
++
++
++def _undetermined_retry(prog, item, prefix, where):
++    """① 重试轮：total 未定论但预算未尽 —— 计数 + 审计 + 日志（队列语义由调用方处理）。"""
++    n = int(item.get('total_none', 0) or 0) + 1
++    item['total_none'] = n
++    audit_event('probe_retry', 'block',
++                {'prefix': prefix, 'reason': 'total_none', 'attempt': n,
++                 'max_attempts': TOTAL_NONE_RETRY_MAX, 'missing_chars': [],
++                 'scope': 'item-total', 'where': where, 'delay_s': PROBE_DEAD_DELAY_S,
++                 'todo_snapshot': len(prog.get('todo') or [])})
++    log(f"    [r3] 条目 total 未定论 {prefix!r}（{where}）→ 重试轮 "
++        f"#{n}/{TOTAL_NONE_RETRY_MAX}，{PROBE_DEAD_DELAY_S:.0f}s 后重排（不丢子树）")
++    return n
++
++
++def _undetermined_degrade(prog, item, prefix, total, reason, where, extra=None):
++    """② 降级记账：单点失败 ⇒ 子树未定论，**登记缺口 + 审计 + 交修复轮**（不静默丢、不假收敛）。
++
++    调用方负责队列语义（并发：条目出队后不再回队；串行：todo.pop(0)）与加锁
++    （并发路径在 q.lock 内调用，保证 progress 快照自洽 I4）。返回缺口 dict。"""
++    ts = datetime.now().isoformat()
++    attempts = {'total_none': int(item.get('total_none', 0) or 0),
++                'item_exc': int(item.get('exc_retry', 0) or 0)}
++    g = _find_undetermined_gap(prog, prefix)
++    if g is None:
++        g = {'p': prefix, 'total': total, 'covered': 0, 'gap': None, 'chars': [],
++             'type': 'undetermined', 'undetermined': True, 'degraded': True,
++             'repair_attempts': int(item.get('repair_attempts', 0) or 0),
++             'ts': ts, 'reason': reason, 'where': where, 'attempts': attempts}
++        prog.setdefault('gaps', []).append(g)
++    else:
++        g['ts'] = ts
++        g['reason'] = reason
++        g['where'] = where
++        g['attempts'] = attempts
++    # 「上次降级时刻」：与 require_ts 配对判定「回队重排后是否又降级」——
++    # requeued_ts > last_degrade_ts ⇒ 该子树重排后**跑完了**（无二次降级）⇒ 修复轮可消解，
++    # 避免把「瞬时失败的子树」永久留在未决缺口里（假未收敛）。
++    g['last_degrade_ts'] = round(time.time(), 3)
++    if total:                                 # total 已知（条目异常路径）⇒ 记可读缺口量
++        g['total'] = int(total)
++        g['covered'] = recorded_count(prefix)
++        g['gap'] = max(0, int(total) - int(g['covered']))
++    led = prog.setdefault('undetermined', [])
++    led.append({'p': prefix, 'ts': ts, 'reason': reason, 'where': where,
++                'total': total, 'attempts': attempts})
++    if len(led) > UNDETERMINED_LEDGER_MAX:
++        del led[:-UNDETERMINED_LEDGER_MAX]
++    _recovery_note(prog, 'undetermined-degrade', prefix,
++                   f"{reason}（{where}）：total={total} 尝试 {attempts} 后仍不可得 "
++                   f"→ 降级登记未决缺口（type=undetermined），收敛判据将拒绝 exit 0")
++    detail = {'prefix': prefix, 'reason': reason, 'scope': 'item-total', 'where': where,
++              'attempted': max(1, attempts['total_none'] + 1),
++              'resolved_chars': 0, 'kids': 0, 'missing_chars': [],
++              'undetermined': True, 'total': total,
++              'covered': g.get('covered'), 'gap': g.get('gap'), 'attempts': attempts,
++              'todo_snapshot': len(prog.get('todo') or [])}
++    if extra:
++        detail.update(extra)
++    audit_event('probe_incomplete', 'block', detail)
++    log(f"    [r3] 条目未定论降级 {prefix!r}（{reason}/{where}）：子树登记为未决缺口，"
++        f"修复轮接手（不再静默跳过、不再无限回队尾）")
++    return g
++
++
++def _keep_resolved_gap(prog, gap, reason):
++    """③ 已消解缺口**留档**（L2/C-5）：从 gaps[] 移除前先落 resolved_gaps[]，
++    使「容差内补齐/records 已覆盖」的残留缺口在收敛报告与覆盖率审计处仍然可见。"""
++    rec = {'p': gap.get('p'), 'type': gap.get('type'), 'total': gap.get('total'),
++           'covered': gap.get('covered'), 'got': gap.get('got'), 'gap': gap.get('gap'),
++           'degraded': bool(gap.get('degraded')),
++           'repair_attempts': int(gap.get('repair_attempts', 0) or 0),
++           'resolved_reason': reason, 'resolved_ts': datetime.now().isoformat()}
++    lst = prog.setdefault('resolved_gaps', [])
++    lst.append(rec)
++    if len(lst) > RESOLVED_GAPS_KEEP:
++        del lst[:-RESOLVED_GAPS_KEEP]
++    return rec
++
++
++# ---------------------------------------------------------------------------
+ # F5：停滞判据（水位/进度年龄阈值 → stall_detected 审计；可选超阈值自停）
+ # ---------------------------------------------------------------------------
+ def progress_watermark(prog):
+@@ -2430,6 +2552,7 @@
+     terminal_gaps = [g for g in gaps if g.get('terminal')]
+     attempts = [int(g.get('repair_attempts', 0) or 0) for g in gaps] or [0]
+     detail = {'todo': todo, 'gaps': len(gaps), 'degraded_gaps': len(degraded),
++              'undetermined_gaps': sum(1 for g in gaps if g.get('type') == 'undetermined'),
+               'terminal_gaps': len(terminal_gaps), 'repair_attempts_max': max(attempts),
+               'repair_attempts_budget': GAP_REPAIR_MAX,
+               'done': len(prog.get('done') or []),
+@@ -2469,6 +2592,18 @@
+                            'missing_chars': len(e.get('failed_chars') or [])}
+                           for e in (prog.get('probe_dead') or [])][-50:],
+            'stats': dict(prog.get('stats') or {}),
++           'resolved_gaps': [{'p': g.get('p'), 'type': g.get('type'),
++                              'total': g.get('total'), 'covered': g.get('covered'),
++                              'got': g.get('got'), 'gap': g.get('gap'),
++                              'degraded': bool(g.get('degraded')),
++                              'repair_attempts': int(g.get('repair_attempts', 0) or 0),
++                              'resolved_reason': g.get('resolved_reason'),
++                              'resolved_ts': g.get('resolved_ts')}
++                             for g in (prog.get('resolved_gaps') or [])],
++           'undetermined': [{'p': e.get('p'), 'reason': e.get('reason'),
++                             'where': e.get('where'), 'total': e.get('total'),
++                             'attempts': e.get('attempts')}
++                            for e in (prog.get('undetermined') or [])][-50:],
+            'audit_counts': audit_counts(),
+            'audit_dropped': _AUDIT_DROPPED,
+            'records_deferred': _RECORDS_DEFERRED,
+@@ -2787,10 +2922,20 @@
+ 
+     # ---- 1) total 解析（基线：total is None / total == 0）----
+     if total is None:
+-        t = get_total(prefix)
++        # R3p4·P4-A（C-1/C-2/C-3）：与串行路径**同路由**。
++        #   · 用 _safe_get_total（F2 的真实全覆盖）：200-缺-info 的 KeyError 记 error_classified
++        #     并返回 None，不再穿到 _conc_worker 的条目异常路径（此前正是活锁入口）；
++        #   · 未定论 ⇒ 预算内重试轮 / 预算耗尽 ⇒ 降级记账（登记缺口 + 审计 + 进修复轮）。
++        t = _safe_get_total(prefix, None, 'conc-item-total')
+         if t is None:
+-            log(f"探测失败 {prefix!r}，跳过")
+-            q.save(prefix)
++            if int(item.get('total_none', 0) or 0) < TOTAL_NONE_RETRY_MAX:
++                _undetermined_retry(prog, item, prefix, 'conc-item-total')
++                _conc_defer(q, item, PROBE_DEAD_DELAY_S, prefix)
++                return
++            with q.lock:                       # prog 变更与 save 同锁（I4 快照自洽）
++                _undetermined_degrade(prog, item, prefix, None, 'total_none',
++                                      'conc-item-total')
++                q.save(prefix)
+             return
+         total = t
+         item['total'] = t
+@@ -2965,9 +3110,38 @@
+             try:
+                 _conc_run_item(prog, q, item, wid)
+             except Exception as e:
+-                # 条目异常不得丢工作：回队尾（R3 域的完整失败预算不在本轮范围）
+-                log(f"    [conc] 条目异常 {item.get('p')!r}: {type(e).__name__}: {e} → 回队尾")
+-                q.put_tail(item, 1.0)
++                # R3p4·P4-A（C-2）：条目异常**必须有尝试预算** —— 无预算的回队尾在
++                # 「注入恒定」时是活锁（实测 25s 内 25 次、进程永不退出、永不写收敛裁决）。
++                #   预算内：分类审计 + retry_scheduled + 延迟回队尾；
++                #   预算耗尽：error_classified + retry_exhausted + 降级记账（登记缺口进修复轮）
++                #             ⇒ 收敛判据判「未收敛」exit 3，进程有界退出。
++                prefix = item.get('p')
++                cls = _audit_exc(e, 'conc-item', prefix)          # request 级 error_classified
++                n = int(item.get('exc_retry', 0) or 0) + 1
++                item['exc_retry'] = n
++                if n <= ITEM_EXC_RETRY_MAX:
++                    audit_event('retry_scheduled', 'request',
++                                {'where': 'conc-item', 'prefix': prefix, 'attempt': n,
++                                 'attempts_max': ITEM_EXC_RETRY_MAX, 'class': cls,
++                                 'wait_s': ITEM_EXC_DELAY_S, 'q': prefix,
++                                 'status_or_exc': f'{type(e).__name__}: {e}'})
++                    log(f"    [conc] 条目异常 {prefix!r}: {type(e).__name__}: {e} "
++                        f"→ 回队尾（{n}/{ITEM_EXC_RETRY_MAX}）")
++                    q.put_tail(item, ITEM_EXC_DELAY_S)
++                else:
++                    audit_event('retry_exhausted', 'request',
++                                {'where': 'conc-item', 'prefix': prefix, 'attempts': n,
++                                 'budget': ITEM_EXC_RETRY_MAX, 'class': cls,
++                                 'q': prefix, 'last_error': f'{type(e).__name__}: {e}'})
++                    log(f"    [conc] 条目异常预算耗尽 {prefix!r}（{n}/{ITEM_EXC_RETRY_MAX}）："
++                        f"{type(e).__name__}: {e} → 降级记账（不再无限回队尾）")
++                    with q.lock:
++                        _undetermined_degrade(prog, item, prefix, item.get('total'),
++                                              'item_exc_budget_exhausted', 'conc-item',
++                                              extra={'class': cls, 'attempts': n,
++                                                     'budget': ITEM_EXC_RETRY_MAX,
++                                                     'exc': f'{type(e).__name__}: {e}'})
++                        q.save(prefix)
+         finally:
+             if item is not None:
+                 q.finish(item)
+@@ -3028,7 +3202,18 @@
+         if total is None:
+             t = _safe_get_total(prefix, None, 'serial-item-total')      # R3·F2
+             if t is None:
+-                log(f"探测失败 {prefix!r}，跳过")
++                # R3p4·P4-A（C-1/C-3）：**绝不静默 `todo.pop(0)` 跳过** —— 那会把
++                # 「条目 total 解析失败」变成 rc=0 + 0 条记录 + 「全部完成」+ gaps=0 的
++                # 假收敛（相对基线的 rc=1 崩溃是失败语义倒退）。改为与并发路径同路由：
++                # 预算内重试轮 / 预算耗尽 ⇒ 降级记账（登记缺口 + 审计 + 进修复轮）。
++                if int(item.get('total_none', 0) or 0) < TOTAL_NONE_RETRY_MAX:
++                    _undetermined_retry(prog, item, prefix, 'serial-item-total')
++                    todo.append(todo.pop(0))                  # = 基线回队尾
++                    save_progress(prog, prefix)
++                    LIMITER.cooldown(PROBE_DEAD_DELAY_S); time.sleep(PROBE_DEAD_DELAY_S)
++                    continue
++                _undetermined_degrade(prog, item, prefix, None, 'total_none',
++                                      'serial-item-total')
+                 todo.pop(0); save_progress(prog, prefix); continue
+             total = t
+             item['total'] = t
+@@ -3181,24 +3366,76 @@
+                  'attempts_max': max([int(g.get('repair_attempts', 0) or 0) for g in gaps] or [0])})
+     for gap in gaps:
+         p = gap['p']
+-        total = gap['total']
+-        tol = max(2, int(total * 0.015))
+-        kept = False                       # 本轮该缺口是否仍未补齐（留在 remaining）
++        total = gap.get('total')
+         if gap.get('terminal'):
+             # 预算已耗尽：不再重修，但**保留**在 gaps[]（收敛判据据此判未收敛）
+             remaining.append(gap)
+             terminal += 1
+             continue
++        # 本轮尝试计数（三种类型共用；下面的预算判定据此标 terminal）
+         gap['repair_attempts'] = int(gap.get('repair_attempts', 0) or 0) + 1
++        if gap.get('type') == 'undetermined':
++            # R3p4·P4-A：未定论子树（条目 total 解析失败 / 条目异常预算耗尽）的修复轮。
++            #   · total 不可得 ⇒ 重新探测（瞬时故障在此自愈）；
++            #   · total 可得且 records 已证明覆盖 ⇒ 消解（留档进 resolved_gaps[]）；
++            #   · total 可得但本轮未证明覆盖 ⇒ 回队重排重跑该子树，缺口留档（预算继续累计）。
++            tp = total
++            if not tp:
++                tp = _safe_get_total(p, None, 'repair-undetermined')
++                if tp:
++                    gap['total'] = tp
++                    log(f"  终局修复未定论块 {p!r}: total 重新探测成功={tp}")
++            # (a) 上次「回队重排」之后没有再次降级 ⇒ 子树已跑完 ⇒ 消解（不留假未收敛）
++            if float(gap.get('requeued_ts', 0) or 0) > float(gap.get('last_degrade_ts', 0) or 0):
++                gap['resolved'] = True
++                gap['resolved_reason'] = 'requeued-completed'
++                _keep_resolved_gap(prog, gap, 'requeued-completed')
++                fixed += 1
++                log(f"  终局修复未定论块 {p!r}: 回队重排后子树已完成"
++                    f"（records={recorded_count(p)}）✓（消解留档）")
++                continue
++            if tp and is_recorded_done(p, tp):
++                gap['resolved'] = True
++                gap['resolved_reason'] = 'records-covered'
++                _keep_resolved_gap(prog, gap, 'undetermined-covered')
++                fixed += 1
++                log(f"  终局修复未定论块 {p!r}: records 反查 {recorded_count(p)}/{tp} ✓（消解留档）")
++                continue
++            if tp:
++                prog['todo'].append({'p': p, 'total': tp})
++                gap['requeued_ts'] = round(time.time(), 3)
++                fixed += 1
++                log(f"  终局修复未定论块 {p!r}: total={tp} → 回队重排（本轮未证明覆盖，缺口留档）")
++            else:
++                log(f"  终局修复未定论块 {p!r}: total 仍不可得 → 保留未决缺口")
++            remaining.append(gap)
++            if int(gap.get('repair_attempts', 0) or 0) >= GAP_REPAIR_MAX:
++                gap['terminal'] = True
++                gap['terminal_reason'] = 'repair-budget-exhausted'
++                audit_event('repair_exhausted', 'block',
++                            {'prefix': p, 'type': 'undetermined',
++                             'attempts': gap.get('repair_attempts'),
++                             'budget': GAP_REPAIR_MAX, 'total': gap.get('total'),
++                             'covered': gap.get('covered'), 'got': gap.get('got'),
++                             'degraded': True, 'reason': gap.get('reason'),
++                             'missing_chars': 0})
++                log(f"  [r3] 未定论缺口 {p!r} 修复预算用尽"
++                    f"（{gap['repair_attempts']}/{GAP_REPAIR_MAX}）→ 标 terminal："
++                    f"收敛判据判「未收敛」（不谎报完成）")
++            continue
++        tol = max(2, int(total * 0.015)) if total else 2
++        kept = False                       # 本轮该缺口是否仍未补齐（留在 remaining）
+         if gap.get('type') == 'leaf':
+             if is_recorded_done(p, total):        # v10: 反查已够 → 免重修
+                 fixed += 1
+                 _tolerance_mark(prog, p, recorded_count(p), total, '终局修复跳过')   # v10-fix
++                _keep_resolved_gap(prog, gap, 'records-covered')                     # L2：留档
+                 log(f"  终局修复叶子 {p!r}: records 反查 {recorded_count(p)}/{total} ✓（跳过重修）")
+                 continue
+             ok, got = scrape_leaf(p, total, deep_retry=True)
+             if got >= total - tol:
+                 fixed += 1
++                _keep_resolved_gap(prog, gap, 'repair-covered')                      # L2：留档
+                 log(f"  终局修复叶子 {p!r}: {got}/{total} ✓")
+             else:
+                 gap['got'] = max(gap.get('got', 0), got)
+@@ -3224,7 +3461,9 @@
+                     kept = True
+                 else:
+                     gap['resolved'] = True
+-                    log(f"  终局修复分支 {p!r} 已补齐（{cov}/{total}）")
++                    gap['resolved_reason'] = 'tolerance-covered'
++                    _keep_resolved_gap(prog, gap, 'tolerance-covered')   # L2：留档，不静默消失
++                    log(f"  终局修复分支 {p!r} 已补齐（{cov}/{total}）→ 消解留档 resolved_gaps[]")
+             else:
+                 remaining.append(gap)
+                 kept = True
+@@ -3318,6 +3557,7 @@
+         f"DEFER_SLOTS={CONC_DEFER_SLOTS}")
+     # R3·slot-converge：自愈/收敛判据配置单行可审计
+     log(f"[r3] 配置 audit={AUDIT_FILE.name} 探测重试≤{PROBE_DEAD_RETRY_MAX}({PROBE_DEAD_DELAY_S:.0f}s) "
++        f"total未定论重试≤{TOTAL_NONE_RETRY_MAX} ITEM_EXC_RETRY_MAX={ITEM_EXC_RETRY_MAX} "
+         f"缺口修复预算={GAP_REPAIR_MAX} 停滞阈值={STALL_PROGRESS_AGE_S:.0f}s/{STALL_STOP_AGE_S:.0f}s"
+         f"(action={STALL_ACTION}) 退出码 收敛={EXIT_CONVERGED} 未收敛={EXIT_INCOMPLETE} "
+         f"停滞自停={EXIT_STALL_STOP} 轮数上限={MAX_ROUNDS}")
+@@ -3351,13 +3591,18 @@
+                     f"terminal_gaps={detail['terminal_gaps']} → exit {rc}")
+                 break
+             if round_num >= MAX_ROUNDS:
++                # R3p4·P4-A（C-5）：rc 同时看 **todo** 与未决缺口 —— 防御性缺口闭合：
++                # 只要还有未做完的条目，就不是收敛（此前只看 gaps_open，todo>0 时会误判 exit 0）。
+                 gaps_open = len(open_gaps(prog))
+-                rc = EXIT_INCOMPLETE if gaps_open else EXIT_CONVERGED
+-                detail2 = dict(detail, reason='max-rounds', max_rounds=MAX_ROUNDS)
++                todo_left = len(prog.get('todo') or [])
++                rc = EXIT_INCOMPLETE if (gaps_open or todo_left) else EXIT_CONVERGED
++                detail2 = dict(detail, reason='max-rounds', max_rounds=MAX_ROUNDS,
++                               todo=todo_left)
+                 audit_event('convergence_decision', 'block',
+                             dict(detail2, decided='continue', terminal=True, exit_code=rc))
+                 write_convergence_report(prog, 'continue', True, rc, 'max-rounds', detail2)
+-                log(f"[r3] 达最大轮数（{MAX_ROUNDS}）：未决缺口 {gaps_open} → exit {rc}")
++                log(f"[r3] 达最大轮数（{MAX_ROUNDS}）：未决缺口 {gaps_open} 未完成条目 {todo_left} "
++                    f"→ exit {rc}")
+                 break
+     finally:
+         _stall_monitor_stop()
+@@ -3370,10 +3615,13 @@
+         log(f"[r3] 收尾：仍有 {left} 条 records 未落盘（已审计 records_write_deferred）")
+         rc = EXIT_INCOMPLETE if rc == EXIT_CONVERGED else rc
+     gaps_left = open_gaps(prog)
++    resolved_arch = list(prog.get('resolved_gaps') or [])
+     if rc == EXIT_CONVERGED:
+         # 收敛：保留原「全部完成」字样（keeper-v2 的 JOB_COMPPAT 依赖），但结论以退出码为准
++        # R3p4·P4-A（C-5/L1）：文案用**真实值**，不再把 `todo=0 gaps=0` 硬编码进字符串。
+         log(f"全部完成！stats={prog['stats']} 收敛判据=exit {EXIT_CONVERGED}"
+-            f"（todo=0 gaps=0，报告={CONV_REPORT_FILE.name}）")
++            f"（todo={len(prog.get('todo') or [])} gaps={len(gaps_left)} "
++            f"resolved_gaps={len(resolved_arch)}，报告={CONV_REPORT_FILE.name}）")
+     else:
+         # 未收敛：**刻意不打印「全部完成」** —— 字符串判据正是 F1/F6 要消灭的东西
+         log(f"未收敛（exit {rc}）：todo={len(prog['todo'])} 未决缺口={len(gaps_left)} "
+@@ -3382,9 +3630,14 @@
+         log(f"=== 最终遗留缺口 ({len(prog['gaps'])}) ===")
+         for g in prog['gaps']:
+             log(f"  {g}")
++    if resolved_arch:
++        log(f"=== 已消解缺口留档 resolved_gaps ({len(resolved_arch)}) ==="
++            f"（覆盖率审计可见，不再静默消失）")
+     audit_event('run_end', 'process',
+                 {'exit_code': rc, 'todo': len(prog.get('todo') or []),
+                  'gaps': len(gaps_left), 'done': len(prog.get('done') or []),
++                 'undetermined': len(prog.get('undetermined') or []),
++                 'resolved_gaps': len(resolved_arch),
+                  'stats': dict(prog.get('stats') or {}),
+                  'audit_counts': audit_counts(), 'audit_dropped': _AUDIT_DROPPED,
+                  'records_deferred': _RECORDS_DEFERRED})

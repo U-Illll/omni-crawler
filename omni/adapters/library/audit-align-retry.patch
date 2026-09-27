@@ -1,0 +1,310 @@
+--- a/audit.py
++++ b/audit.py
+@@ -1,6 +1,6 @@
+ #!/usr/bin/env python3
+ # -*- coding: utf-8 -*-
+-"""R3 自愈轮 · 结构化审计模块 v1（三级事件统一出口）
++"""R3 自愈轮 · 结构化审计模块 v2（三级事件统一出口 · 契约 r3-audit-contract-v2）
+ 
+ 用途
+ ----
+@@ -9,10 +9,24 @@
+ **request 级**事件（`retry_scheduled` / `retry_exhausted` / `error_classified`），
+ 但接口对三级通用，供其它槽复用（可加字段，不破坏既有解析）。
+ 
+-字段（schema §公共字段）
+------------------------
+-`ts`(epoch float) `ts_iso`(ISO 字符串) `pid`(int) `seq`(进程内单调 int)
+-`level`("request"|"block"|"process") `event`(事件名) `detail`(对象) `run`(可选)
++字段（契约 v2 §1，三写者统一布局）
++---------------------------------
++`schema`("r3-audit-v2") `ts_epoch`(epoch float，**权威时间**) `ts_iso`(ISO 字符串)
++`pid`(int) `seq`(进程内从 1 严格 +1) `level`("request"|"block"|"process") `event`(事件名)
++`detail`(对象) `run`(可选)
++遗留键 `ts` **不再写入**（契约 §1 裁决：历史 ts 三侧语义不一）。
++
++R3-P4 修复（crit-correct R-7 / M4）
++----------------------------------
++· **F3 inode 存活校验**：`_ensure_fd()` 每次写前用 `st_nlink + (dev,ino)` 核对 fd 指向的
++  inode 是否仍是路径上的那个文件。目录被 `rm -rf` / 文件被 unlink / 被外部轮转改名后，
++  旧 fd 的 `os.write` 会"成功"但数据进黑洞 —— 现在改为：检测 → 关闭 → **一次自愈**
++  （重建目录 + 重开）→ 仍失败则 `errors += 1` 并返回 None（**绝不静默成功**）。
++· **轮转多写者语义（显式豁免）**：单写者保持原语义（超限 → `audit.jsonl.1`）；
++  一旦发现真实文件大小与本人计数不符（存在外部写者），**放弃轮转**（避免 `os.replace`
++  覆盖他人数据），改为采纳真实大小 + 计数 `rotate_skipped_shared`。理由：共享 sink 上的
++  rename 轮转无法在不加锁的前提下保证不丢数据；本模块的定位是"旁路观测面"，宁可单调增长
++  也不静默丢事件。豁免由 `selftest: rotate.multi_writer_no_rotate` 覆盖。
+ 
+ 设计约束
+ --------
+@@ -43,6 +57,7 @@
+ __all__ = ['LEVELS', 'init', 'emit', 'emit_request', 'emit_block', 'emit_process',
+            'path', 'is_enabled', 'stats', 'close', 'reset', 'DEFAULT_NAME']
+ 
++SCHEMA = 'r3-audit-v2'          # 契约 v2 §1：三写者统一 schema 值
+ LEVELS = ('request', 'block', 'process')
+ ENV_AUDIT = 'SCRAPE_AUDIT'
+ ENV_OUT_DIR = 'SCRAPE_OUT_DIR'
+@@ -70,6 +85,11 @@
+     'rotate_bytes': int(ROTATE_MB_DEFAULT * 1024 * 1024),
+     'init_n': 0,
+     'calls': 0,            # emit 调用次数（含被禁用/失败的）
++    'dropped': 0,          # 检测到写不进去而**主动丢弃**的事件数（R-7：不得静默成功）
++    'fd_reopens': 0,       # inode 失活/换代导致的 fd 重开次数
++    'heals': 0,            # 目录重建（F3 自愈）次数
++    'rotate_skipped_shared': 0,   # 因检测到多写者而放弃轮转的次数
++    'external_writes_seen': 0,    # 真实大小 ≠ 本人计数的观测次数
+ }
+ _LOCK = threading.RLock()
+ 
+@@ -142,6 +162,11 @@
+                 _ST['by_level'] = {}
+                 _ST['calls'] = 0
+                 _ST['last_error'] = None
++                _ST['dropped'] = 0
++                _ST['fd_reopens'] = 0
++                _ST['heals'] = 0
++                _ST['rotate_skipped_shared'] = 0
++                _ST['external_writes_seen'] = 0
+             if enabled is None:
+                 enabled = enabled_by_env() and bool(new_path)
+             if not new_path:
+@@ -194,7 +219,9 @@
+         _close_fd()
+         _ST.update({'path': None, 'seq': 0, 'written': 0, 'errors': 0, 'bytes': 0,
+                     'rotations': 0, 'by_event': {}, 'by_level': {}, 'calls': 0,
+-                    'last_error': None, 'enabled': True, 'last_ts': None, 'init_n': 0})
++                    'last_error': None, 'enabled': True, 'last_ts': None, 'init_n': 0,
++                    'dropped': 0, 'fd_reopens': 0, 'heals': 0,
++                    'rotate_skipped_shared': 0, 'external_writes_seen': 0})
+ 
+ 
+ def stats():
+@@ -217,8 +244,35 @@
+         return None
+ 
+ 
++def _fd_alive(fd):
++    """fd 指向的 inode 是否仍是当前路径上的那个文件（R-7/M4：F3 的静默丢数据路径）。
++
++    `rm -rf <out>` 或 `os.replace(path, path + '.1')` 之后，已打开的 fd 依然"可写"，
++    但 `os.write` 返回的字节数照常 ⇒ 旧实现会把它记为 written+=1、errors=0，而文件不存在。
++    这里用 `st_nlink` + `(st_dev, st_ino)` 双重核对，把这条路径变成**显式失败**。
++    """
++    if fd is None:
++        return False
++    try:
++        st = os.fstat(fd)
++    except OSError:
++        return False
++    if st.st_nlink <= 0:                 # 已 unlink（无目录项）
++        return False
++    try:
++        cur = os.stat(str(_ST['path']))
++    except OSError:
++        return False                     # 目录/文件没了
++    return (cur.st_dev, cur.st_ino) == (st.st_dev, st.st_ino)
++
++
+ def _ensure_fd():
+     fd = _ST.get('fd')
++    if fd is not None and not _fd_alive(fd):
++        # inode 已失活（被删/被改名/被外部轮转）⇒ 旧 fd 写入进黑洞，必须先换代
++        _close_fd()
++        _ST['fd_reopens'] += 1
++        fd = None
+     if fd is None:
+         fd = os.open(str(_ST['path']), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+         _ST['fd'] = fd
+@@ -226,11 +280,29 @@
+ 
+ 
+ def _rotate_if_needed():
+-    """按大小轮转：audit.jsonl → audit.jsonl.1（覆盖旧 .1）。仅在锁内调用。"""
++    """按大小轮转：audit.jsonl → audit.jsonl.1（覆盖旧 .1）。仅在锁内调用。
++
++    **多写者语义（R-7 · 显式豁免，见模块 docstring）**：若真实文件大小 ≠ 本人计数
++    （有外部写者/别的实例/keeper 也在写同一个 sink），则**放弃轮转** —— 共享 sink 上的
++    `os.replace` 轮转会覆盖他人数据，且本人 fd 会指向已改名的 inode。此时改为采纳真实
++    大小并计数 `rotate_skipped_shared`，由上层按"文件单调增长"处理。
++    """
+     limit = _ST.get('rotate_bytes') or 0
+-    if limit <= 0 or _ST['bytes'] < limit:
++    if limit <= 0:
+         return False
+     try:
++        real = os.stat(str(_ST['path'])).st_size
++    except OSError:
++        real = _ST['bytes']
++    if real != _ST['bytes']:
++        _ST['external_writes_seen'] += 1
++        _ST['bytes'] = real              # 采纳真实大小（本人计数不可信时不轮转）
++    if _ST['bytes'] < limit:
++        return False
++    if _ST['external_writes_seen']:
++        _ST['rotate_skipped_shared'] += 1
++        return False                     # 多写者 ⇒ 显式放弃轮转（不覆盖他人数据）
++    try:
+         _close_fd()
+         os.replace(str(_ST['path']), str(_ST['path']) + '.1')
+         _ST['bytes'] = 0
+@@ -241,6 +313,35 @@
+         return False
+ 
+ 
++def _write_blob(data):
++    """写一行（含 F3 自愈重试）。成功 True；失败 False ⇒ 调用方计 dropped/errors。"""
++    try:
++        os.write(_ensure_fd(), data)            # 单次 O_APPEND 原子追加
++        return True
++    except OSError:
++        pass
++    _close_fd()                                 # 句柄可能指向失活 inode ⇒ 换新
++    _ST['fd'] = None
++    return _heal_and_retry(data)
++
++
++def _heal_and_retry(data):
++    """F3 自愈：重建审计文件所在目录 → 重开 fd → 重写一次。成功返回 True。"""
++    if not _ST.get('enabled') or not _ST.get('path'):
++        return False
++    try:
++        d = os.path.dirname(os.path.abspath(str(_ST['path'])))
++        if d:
++            os.makedirs(d, exist_ok=True)
++            _ST['heals'] += 1
++        fd = _ensure_fd()
++        os.write(fd, data)
++        return True
++    except OSError as e:
++        _ST['last_error'] = '%s: %s' % (type(e).__name__, e)
++        return False
++
++
+ def emit(level, event, detail=None, run=None, **fields):
+     """写一条审计事件。返回写入的记录 dict，失败/禁用 ⇒ None。**绝不抛异常**。
+ 
+@@ -265,9 +366,9 @@
+                 d = {'value': detail}
+             if fields:
+                 d.update(fields)
+-            rec = {'ts': round(float(ts), 6), 'ts_iso': _iso(ts), 'pid': os.getpid(),
+-                   'seq': _ST['seq'], 'level': level, 'event': event, 'detail': d,
+-                   'run': run if run is not None else _ST['run']}
++            rec = {'schema': SCHEMA, 'ts_epoch': round(float(ts), 6), 'ts_iso': _iso(ts),
++                   'pid': os.getpid(), 'seq': _ST['seq'], 'level': level, 'event': event,
++                   'detail': d, 'run': run if run is not None else _ST['run']}
+             try:
+                 line = json.dumps(rec, ensure_ascii=False, sort_keys=False, default=str) + '\n'
+             except Exception:
+@@ -282,13 +383,15 @@
+                     raw = repr(d)[:DETAIL_MAX_CHARS]
+                 rec['detail'] = {'_truncated': True, 'raw': raw}
+                 data = (json.dumps(rec, ensure_ascii=False, default=str) + '\n').encode('utf-8')
+-            fd = _ensure_fd()
+-            os.write(fd, data)                  # 单次 O_APPEND 原子追加
++            if not _write_blob(data):           # R-7/M4：失败绝不静默"成功"
++                _ST['dropped'] += 1
++                _ST['errors'] += 1
++                return None
+             _ST['written'] += 1
+             _ST['bytes'] += len(data)
+             _ST['by_event'][event] = _ST['by_event'].get(event, 0) + 1
+             _ST['by_level'][level] = _ST['by_level'].get(level, 0) + 1
+-            _ST['last_ts'] = rec['ts']
++            _ST['last_ts'] = rec['ts_epoch']
+             _rotate_if_needed()
+     except Exception as e:
+         _ST['errors'] += 1
+@@ -313,6 +416,7 @@
+ # selftest：python3 audit.py
+ # ---------------------------------------------------------------------------
+ def _selftest():
++    import shutil
+     import tempfile
+     ok = 0
+     bad = 0
+@@ -339,12 +443,15 @@
+     with open(p, encoding='utf-8') as f:
+         recs = [json.loads(l) for l in f if l.strip()]
+     chk('lines', len(recs) == 4, 'n=%d' % len(recs))
+-    chk('schema.keys', all(set(r) >= {'ts', 'ts_iso', 'pid', 'seq', 'level', 'event',
+-                                      'detail', 'run'} for r in recs))
++    chk('schema.keys', all(set(r) >= {'schema', 'ts_epoch', 'ts_iso', 'pid', 'seq', 'level',
++                                      'event', 'detail', 'run'} for r in recs))
++    chk('schema.value', all(r['schema'] == 'r3-audit-v2' for r in recs))
++    chk('no_legacy_ts', all('ts' not in r for r in recs))
+     chk('seq.monotonic', [r['seq'] for r in recs] == [1, 2, 3, 4])
+     chk('level.enum', all(r['level'] in LEVELS for r in recs))
+     chk('detail.obj', all(isinstance(r['detail'], dict) for r in recs))
+-    chk('ts.float', all(isinstance(r['ts'], float) and r['ts'] > 0 for r in recs))
++    chk('ts_epoch.float', all(isinstance(r['ts_epoch'], float) and r['ts_epoch'] > 0
++                              for r in recs))
+     chk('run.propagated', all(r['run'] == 'selftest' for r in recs))
+     st = stats()
+     chk('stats.written', st['written'] == 4 and st['errors'] == 0, str(st['by_event']))
+@@ -363,6 +470,64 @@
+     r = emit_request('retry_scheduled', {'attempt': 1})
+     chk('failopen', r is None and stats()['errors'] >= 1)
+     reset()
++
++    # ---- R-7/M4：F3 场景（目录被删）不得静默"成功" ----
++    reset()
++    d2 = os.path.join(tmp, 'f3')
++    os.makedirs(d2, exist_ok=True)
++    p2 = os.path.join(d2, 'audit.jsonl')
++    init(path=p2, run='f3', reset_seq=True)
++    emit_request('error_classified', {'class': 'x', 'action': 'retry'})
++    assert os.path.getsize(p2) > 0
++    shutil.rmtree(d2)                              # 模拟 rm -rf <out>
++    rec2 = emit_request('retry_scheduled', {'attempt': 1, 'wait_s': 2.0})
++    exists = os.path.exists(p2)
++    size2 = os.path.getsize(p2) if exists else 0
++    chk('f3.no_silent_success',
++        (rec2 is not None and exists and size2 > 0)          # 自愈：真的落盘了
++        or (rec2 is None and stats()['dropped'] >= 1),       # 或显式丢弃
++        'rec=%s exists=%s size=%d dropped=%d' % (rec2 is not None, exists, size2,
++                                                 stats()['dropped']))
++    chk('f3.on_disk_visible',
++        (not exists) or ('retry_scheduled' in open(p2, encoding='utf-8').read()))
++    chk('f3.heal_or_drop', stats()['heals'] >= 1 or stats()['dropped'] >= 1,
++        str({k: stats()[k] for k in ('heals', 'errors', 'dropped', 'fd_reopens')}))
++    # 不可自愈路径（父目录不可创建）⇒ 返回 None + dropped>0
++    init(path='/proc/definitely/not/here/audit.jsonl', run='f3b', reset_seq=True)
++    r3 = emit_request('retry_scheduled', {'attempt': 1})
++    chk('f3b.explicit_drop', r3 is None and stats()['dropped'] >= 1,
++        str({k: stats()[k] for k in ('dropped', 'errors')}))
++    reset()
++
++    # ---- R-7：轮转的多写者语义（显式豁免：检测到外部写者 ⇒ 不再轮转、不覆盖） ----
++    reset()
++    d3 = os.path.join(tmp, 'rot')
++    os.makedirs(d3, exist_ok=True)
++    p3 = os.path.join(d3, 'audit.jsonl')
++    init(path=p3, run='rot', reset_seq=True, rotate_bytes=200)
++    for i in range(3):                             # 阶段1：本进程独占（轮转按原语义）
++        emit_request('retry_scheduled', {'attempt': i, 'pad': 'x' * 40})
++    rot_before = stats()['rotations']
++    n_before = stats()['written']
++    with open(p3, 'a', encoding='utf-8') as f:     # 外部写者插一行
++        f.write(json.dumps({'schema': 'r3-audit-v2', 'ts_epoch': time.time(),
++                            'ts_iso': _iso(time.time()), 'pid': 999999, 'seq': 1,
++                            'level': 'process', 'event': 'keeper_start',
++                            'detail': {}}) + '\n')
++    for i in range(3):                             # 阶段2：共享 sink
++        emit_request('retry_scheduled', {'attempt': 10 + i, 'pad': 'y' * 40})
++    st = stats()
++    rows = [json.loads(l) for l in open(p3, encoding='utf-8') if l.strip()]
++    mine_phase2 = [r for r in rows if (r.get('detail') or {}).get('attempt') in (10, 11, 12)]
++    chk('rotate.multi_writer_no_rotate',
++        st['rotate_skipped_shared'] >= 1 and st['rotations'] == rot_before,
++        'rotations %d→%d skipped=%d' % (rot_before, st['rotations'],
++                                        st['rotate_skipped_shared']))
++    chk('rotate.no_loss_after_shared', len(mine_phase2) == 3,
++        'phase2 rows=%d（阶段1 已轮转 %d 次，written=%d→%d）'
++        % (len(mine_phase2), rot_before, n_before, st['written']))
++    chk('rotate.peer_row_kept', any(r.get('pid') == 999999 for r in rows))
++    reset()
+     print('audit.py selftest: %d pass / %d fail' % (ok, bad))
+     return 0 if bad == 0 else 1
+ 

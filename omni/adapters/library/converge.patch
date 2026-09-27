@@ -1,0 +1,1300 @@
+--- refs/scrape-r2cand.py
++++ impl/slot-converge/scrape.py
+@@ -300,8 +300,18 @@
+     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+     with LOG_LOCK:
+         print(line, flush=True)
+-        with open(LOG_FILE, 'a') as f:
+-            f.write(line + "\n")
++        try:                                            # R3·slot-converge (F3)
++            with open(LOG_FILE, 'a') as f:
++                f.write(line + "\n")
++        except OSError:
++            # output 目录消失/只读/磁盘异常：重建后重试一次；仍失败也**不得**打死长程任务
++            # （v10 原实现裸 open(...,'a') → FileNotFoundError 从任意 log() 调用点冲出主循环）
++            if ensure_out_dir('log'):
++                try:
++                    with open(LOG_FILE, 'a') as f:
++                        f.write(line + "\n")
++                except OSError:
++                    pass
+ 
+ # ---------------------------------------------------------------------------
+ # v10 持久化层：原子写 + records 反查
+@@ -373,30 +383,130 @@
+     log(f"=== FAULT-INJECT {point} n={n} prefix={prefix!r} pid={os.getpid()} → SIGKILL ===")
+     os.kill(os.getpid(), signal.SIGKILL)
+ 
++def _fd_alive(fd):
++    """fd 指向的文件是否仍链接在目录里（R3·F3）。
++
++    `rm` 掉 output 目录/文件后，已打开的 fd 仍然"可写"，但数据全进黑洞
++    （inode 已无目录项，st_nlink==0）—— 这是比 FileNotFoundError 更隐蔽的丢数据路径。"""
++    try:
++        return os.fstat(fd).st_nlink > 0
++    except OSError:
++        return False
++
++
+ def _records_fd_get():
+-    global _records_fd
++    """records.jsonl 追加句柄（O_APPEND）。
++
++    R3·slot-converge (F3)：句柄按 **output 目录世代**（_OUT_DIR_EPOCH）+ **inode 存活**
++    双重校验 —— 目录被删掉重建后，旧 fd 指向的是已删除的 inode，继续写会**静默丢数据**
++    （不报错、文件不在），因此任一条件不满足都先关旧句柄再重开。"""
++    global _records_fd, _RECORDS_FD_EPOCH
++    if _records_fd is not None and (_RECORDS_FD_EPOCH != _OUT_DIR_EPOCH
++                                    or not _fd_alive(_records_fd)):
++        try:
++            os.close(_records_fd)
++        except OSError:
++            pass
++        _records_fd = None
+     if _records_fd is None:
+         _records_fd = os.open(str(RECORDS_FILE),
+                               os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
++        _RECORDS_FD_EPOCH = _OUT_DIR_EPOCH
+     return _records_fd
+ 
++
++def _records_write_resilient(data, prefix=None):
++    """records 追加的韧性写（必须在 _records_lock 内调用）：检测→重建→重试 3 次。
++
++    R3·slot-converge (F3)：目录消失 / 只读 / ENOSPC 之类的瞬时故障不得打死长程任务。
++    返回 True=已 fsync 落盘；False=已放弃（由调用方转入待写缓冲 + 审计）。"""
++    global _records_fd
++    last = None
++    for attempt in (1, 2, 3):
++        try:
++            if not OUT.is_dir():
++                _ensure_out_dir_raw('records')
++                _note_dir_recreated('records')       # R3·F3：数据面先撞上目录消失也要留审计
++            fd = _records_fd_get()
++            _write_all(fd, data)
++            os.fsync(fd)
++            return True
++        except OSError as e:
++            last = e
++            try:
++                if _records_fd is not None:
++                    os.close(_records_fd)
++            except OSError:
++                pass
++            _records_fd = None
++            time.sleep(0.05 * attempt)
++    audit_event('records_write_deferred', 'process',
++                {'prefix': prefix, 'bytes': len(data),
++                 'err': f'{type(last).__name__}: {last}',
++                 'deferred_records': _RECORDS_DEFERRED})
++    try:
++        log(f"[r3] records 写入失败（{type(last).__name__}: {last}）→ 转入待写缓冲"
++            f"（{_RECORDS_DEFERRED} 条待补写），抓取继续；下次追加时优先补写")
++    except Exception:
++        pass
++    return False
++
++
++def _records_pending_flush():
++    """把待写缓冲拼到本次数据前面（**必须在 _records_lock 内**）；返回 (blob, n_pending)。"""
++    pend = _RECORDS_PENDING
++    blob = b''.join(pend)
++    return blob, len(pend)
++
++
++def flush_pending_records():
++    """收尾/显式冲刷待写缓冲。返回仍未落盘的记录条数（0=全部落盘）。"""
++    global _RECORDS_DEFERRED
++    with _records_lock:
++        if not _RECORDS_PENDING:
++            return 0
++        blob = b''.join(_RECORDS_PENDING)
++        if _records_write_resilient(blob, prefix=None):
++            del _RECORDS_PENDING[:]
++            _RECORDS_DEFERRED = 0
++            return 0
++        return _RECORDS_DEFERRED
++
++
+ def append_records(recs, prefix=None):
+     """行级原子追加：整块先序列化 → 单次 O_APPEND write → fsync。
+     单次 os.write 在 kill -9 下不会被撕裂（内核写完该系统调用才投递信号），
+-    fsync 保证断电后已确认的记录不丢。返回写入条数。"""
++    fsync 保证断电后已确认的记录不丢。返回写入条数。
++
++    R3·slot-converge (F3)：目录消失/写失败 ⇒ 重建重试，仍失败转待写缓冲（有上限），
++    审计 records_write_deferred —— 数据面宁可"延迟落盘 + 有痕迹"，不可"进程被打死"。"""
++    global _RECORDS_DEFERRED
+     if not recs:
+         return 0
+     blob = b''.join(json.dumps(r, ensure_ascii=False).encode('utf-8') + b'\n'
+                     for r in recs)
+     with _records_lock:
+-        fd = _records_fd_get()
++        pend_blob, n_pend = _records_pending_flush()
+         _fault('before_records', prefix)
+-        _write_all(fd, blob)
+-        os.fsync(fd)
++        ok = _records_write_resilient(pend_blob + blob, prefix)
++        if ok:
++            del _RECORDS_PENDING[:]
++            _RECORDS_DEFERRED = 0
++        else:
++            _RECORDS_PENDING.append(blob)
++            _RECORDS_DEFERRED += len(recs)
++            if _RECORDS_DEFERRED > RECORDS_PENDING_MAX:      # 上限保护：丢最旧的待写块
++                dropped = _RECORDS_PENDING.pop(0)
++                _RECORDS_DEFERRED -= dropped.count(b'\n')
++                audit_event('records_write_dropped', 'process',
++                            {'reason': 'pending-buffer-overflow',
++                             'limit': RECORDS_PENDING_MAX,
++                             'dropped_records': dropped.count(b'\n')})
+         _fault('after_records', prefix)
+-    if prefix:
++    # 只有**确认落盘**才记入反查计数：反查闸门 is_recorded_done() 必须只相信磁盘
++    if ok and prefix:
+         note_recorded(prefix, len(recs))
+-    return len(recs)
++    return len(recs) if ok else 0
+ 
+ def note_recorded(prefix, n):
+     if prefix and n:
+@@ -436,8 +546,26 @@
+                    f'→ 按容差判定完成（非精确完成，已在 recovery[] 留痕）')
+     return True
+ 
++def _write_progress_atomic(data, tmp):
++    """progress.json 的原子落盘（v10 逐行语义，抽成函数供 F3 重试复用）。"""
++    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
++    try:
++        _write_all(fd, data)
++        os.fsync(fd)          # 必须先落盘再改名：否则断电后改名指向的可能是空文件
++    finally:
++        os.close(fd)
++    if PROGRESS_FILE.exists():
++        os.replace(str(PROGRESS_FILE), str(PROGRESS_BAK))   # 旧好状态进备份槽（原子）
++    os.replace(str(tmp), str(PROGRESS_FILE))
++    _fsync_dir(OUT)
++
++
+ def save_progress(prog, ctx=None):
+-    """原子替换 + 双槽备份：任何时刻磁盘上都不存在半写 progress.json。"""
++    """原子替换 + 双槽备份：任何时刻磁盘上都不存在半写 progress.json。
++
++    R3·slot-converge (F3)：output 目录消失/瞬时 IO 异常 ⇒ 检测 + 重建 + 重试一次，
++    仍失败只写 progress_write_failed 审计并继续（v10 原实现会让 FileNotFoundError
++    从 8 个调用点之一冲出去打死长程任务）。"""
+     prog['schema'] = SCHEMA
+     prog['saved'] = datetime.now().isoformat()
+     data = json.dumps(prog, ensure_ascii=False, indent=1).encode('utf-8')
+@@ -445,16 +573,22 @@
+         f"progress.json.tmp.{os.getpid()}.{threading.get_ident()}")
+     with _progress_lock:
+         _fault('before_progress', ctx)
+-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+         try:
+-            _write_all(fd, data)
+-            os.fsync(fd)          # 必须先落盘再改名：否则断电后改名指向的可能是空文件
+-        finally:
+-            os.close(fd)
+-        if PROGRESS_FILE.exists():
+-            os.replace(str(PROGRESS_FILE), str(PROGRESS_BAK))   # 旧好状态进备份槽（原子）
+-        os.replace(str(tmp), str(PROGRESS_FILE))
+-        _fsync_dir(OUT)
++            _write_progress_atomic(data, tmp)
++        except OSError as _e1:
++            _recreated = ensure_out_dir('progress')                  # R3 (F3)
++            try:
++                _write_progress_atomic(data, tmp)
++            except OSError as _e2:
++                audit_event('progress_write_failed', 'process',
++                            {'err': f'{type(_e2).__name__}: {_e2}',
++                             'first_err': f'{type(_e1).__name__}: {_e1}',
++                             'recreated': bool(_recreated), 'ctx': ctx})
++                try:                                                 # 只告警，不抛出
++                    log(f"[r3] progress.json 落盘失败（{type(_e2).__name__}: {_e2}）→ 本轮跳过，"
++                        f"进度以下一成功快照为准；已写 progress_write_failed 审计")
++                except Exception:
++                    pass
+         _fault('after_progress', ctx)
+     # R2·心跳/水位：progress 落盘之后再写（X2 缺口闭合）。
+     # P4/H1（crit-correct H1）：监控 sidecar **不得**有能力中断数据路径 —— 心跳模块缺席
+@@ -1687,23 +1821,365 @@
+     append_records(list(got.values()), prefix)      # v10: 行级原子追加 + fsync
+     return True, len(got)
+ 
++# ===========================================================================
++# R3·slot-converge —— 块级兜底（C2）/ 收敛判据机器化（F1·F6）/ 停滞判据（F5）
++#                     / 边界修复（F2 HTTP-200-缺-info 调用侧容错；F3 output 目录消失）
++#
++# 一、退出码即机器判据（F6：去掉「grep 全部完成」这种字符串判据）
++#   exit 0  收敛：todo 为空 **且** 无未决缺口（gaps 里没有未修复条目）
++#   exit 2  --reconcile-only 无法加载 progress（v10 原义，保留）
++#   exit 3  未收敛：todo 为空但仍有未决缺口（且修复预算已耗尽）
++#           —— F1「探测失败丢子树仍 exit 0」的正面修复：不再声称收敛
++#   exit 4  停滞自停：SCRAPE_STALL_ACTION=stop 且进度年龄 ≥ 自停阈值
++#   报告：OUT/convergence-report.json（r3-convergence-v1，含 decided/terminal/exit_code/缺口清单）
++#
++# 二、审计事件（每行 JSON → OUT/audit.jsonl，遵循 R3/refs/r3-audit-schema.md）
++#   block   : probe_all_dead / probe_incomplete / probe_retry / repair_round_enter /
++#             repair_round_result / repair_exhausted / convergence_decision / stall_detected
++#   request : error_classified（F2 的 200-缺-info 等；按 (class, where) 限流防洪泛）
++#   process : output_dir_recreated / records_write_deferred / records_write_dropped /
++#             progress_write_failed / run_start / run_end / graceful_stop
++#
++# 三、块级兜底阶梯（C2：probe 全灭的**明确语义**，替换"静默丢子树"）
++#   探测字符三种结局：命中(t>0) / 确证为空(t==0) / 未定论(None 或抛异常，含 200-缺-info)
++#   未定论 ⇒ ①重试轮：父块带 probe_dead 计数延迟重排（≤PROBE_DEAD_RETRY_MAX 次）
++#             ②降级：保留已命中子块 + 父块自身页，未定论子树登记为**未决缺口**进修复轮
++#             ③修复轮：final_recheck_round 用另一排序复验这些字符（≤GAP_REPAIR_MAX 次）
++#             ④预算耗尽：缺口标 terminal ⇒ 收敛判据判"未收敛"（exit 3），不洗成完成
++# ===========================================================================
++
++R3_AUDIT_SCHEMA = 'r3-audit-v1'
++EXIT_CONVERGED = 0
++EXIT_INCOMPLETE = int(_env_num('SCRAPE_INCOMPLETE_EXIT', 3, int))   # 未收敛退出码（可配 0 兼容旧 keeper）
++EXIT_STALL_STOP = int(_env_num('SCRAPE_STALL_EXIT', 4, int))
++
++# ---- 块级兜底（C2）参数 ---------------------------------------------------
++PROBE_ROUNDS = int(_env_num('SCRAPE_PROBE_ROUNDS', 3, int))              # 探测轮数（v9 硬编码 3）
++PROBE_DEAD_RETRY_MAX = int(_env_num('SCRAPE_PROBE_DEAD_RETRY', 2, int))  # 全灭后父块重试轮上限
++PROBE_DEAD_DELAY_S = float(_env_num('SCRAPE_PROBE_DEAD_DELAY_S', 30.0, float))
++GAP_REPAIR_MAX = int(_env_num('SCRAPE_GAP_REPAIR_MAX', 2, int))          # 单缺口进修复轮次数上限
++MAX_ROUNDS = int(_env_num('SCRAPE_MAX_ROUNDS', 12, int))                 # 主循环轮数上限
++
++# ---- 停滞判据（F5）参数 ---------------------------------------------------
++STALL_PROGRESS_AGE_S = float(_env_num('SCRAPE_STALL_AGE_S', 900.0, float))     # 审计阈值
++STALL_STOP_AGE_S = float(_env_num('SCRAPE_STALL_STOP_AGE_S', 1800.0, float))   # 自停阈值
++STALL_ACTION = (os.environ.get('SCRAPE_STALL_ACTION') or 'audit').strip().lower()
++if STALL_ACTION not in ('audit', 'stop'):      # 非法值 ⇒ fail-safe：只审计，不自停
++    STALL_ACTION = 'audit'
++STALL_MONITOR_ENABLED = int(_env_num('SCRAPE_STALL_MONITOR', 1, int))
++STALL_CHECK_EVERY_S = max(0.05, float(_env_num('SCRAPE_STALL_CHECK_S', 5.0, float)))
++
++# ---- 审计 / IO 加固参数 ---------------------------------------------------
++AUDIT_FILE = Path(os.environ.get('SCRAPE_AUDIT_FILE') or (OUT / 'audit.jsonl'))
++CONV_REPORT_FILE = Path(os.environ.get('SCRAPE_CONV_REPORT') or (OUT / 'convergence-report.json'))
++CLASSIFY_AUDIT_MAX = int(_env_num('SCRAPE_CLASSIFY_AUDIT_MAX', 20, int))
++RECORDS_PENDING_MAX = int(_env_num('SCRAPE_RECORDS_PENDING_MAX', 50000, int))
++
++_AUDIT_LOCK = threading.Lock()
++_AUDIT_FD = None
++_AUDIT_SEQ = 0
++_AUDIT_DROPPED = 0
++_AUDIT_RUN_ID = None
++_CLASSIFY_SEEN = {}
++_OUT_DIR_LOCK = threading.RLock()
++_OUT_DIR_EPOCH = 0               # output 目录世代（重建一次 +1；records fd 据此失效重开）
++_RECORDS_FD_EPOCH = -1
++_RECORDS_PENDING = []            # 待写缓冲（写明前失败时的降级落点）
++_RECORDS_DEFERRED = 0
++_PROGRESS_STATE = {'watermark': None, 'last_change_ts': None, 'stall_audited': False,
++                   'stall_stop_fired': False, 'ticks': 0}
++_STALL_THREAD = {'t': None, 'stop': None}
++LAST_REPAIR_SUMMARY = {'entered': False, 'gaps_in': 0, 'fixed': 0, 'remaining': 0, 'terminal': 0}
++LAST_CONVERGENCE = {}
++
++
++def _r3_run_id():
++    global _AUDIT_RUN_ID
++    if _AUDIT_RUN_ID is None:
++        _AUDIT_RUN_ID = (os.environ.get('SCRAPE_RUN_ID')
++                         or f"{os.getpid()}-{int(time.time())}")
++    return _AUDIT_RUN_ID
++
++
++def _audit_fd_close():
++    global _AUDIT_FD
++    if _AUDIT_FD is not None:
++        try:
++            os.close(_AUDIT_FD)
++        except OSError:
++            pass
++        _AUDIT_FD = None
++
++
++def _audit_fd_get():
++    global _AUDIT_FD
++    if _AUDIT_FD is not None:
++        if not OUT.is_dir():                       # R3·F3：目录没了 → 先重建
++            _ensure_out_dir_raw('audit')
++        if not _fd_alive(_AUDIT_FD):               # 被删/孤立 inode → 重开，避免审计进黑洞
++            _audit_fd_close()
++    if _AUDIT_FD is None:
++        _AUDIT_FD = os.open(str(AUDIT_FILE),
++                            os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
++    return _AUDIT_FD
++
++
++def audit_event(event, level='block', detail=None, run=None):
++    """写一行结构化自愈审计事件（C3：每级自愈事件都必须有结构化记录）。
++
++    永不抛异常、永不阻塞数据面：审计是**观测面**，任何失败都只能降级为计数丢失
++    （审计自身写失败 → 尝试重建 output 目录重写一次 → 仍失败则丢弃该事件并计数）。"""
++    global _AUDIT_SEQ, _AUDIT_DROPPED
++    try:
++        with _AUDIT_LOCK:
++            _AUDIT_SEQ += 1
++            ev = {'ts': round(time.time(), 3),
++                  'ts_iso': datetime.now().isoformat(timespec='milliseconds'),
++                  'pid': os.getpid(), 'seq': _AUDIT_SEQ, 'schema': R3_AUDIT_SCHEMA,
++                  'level': level, 'event': event, 'run': run or _r3_run_id(),
++                  'detail': detail if isinstance(detail, dict) else {'value': detail}}
++            blob = (json.dumps(ev, ensure_ascii=False) + '\n').encode('utf-8')
++            for attempt in (1, 2):
++                try:
++                    fd = _audit_fd_get()
++                    _write_all(fd, blob)
++                    os.fsync(fd)
++                    return ev
++                except OSError:
++                    _audit_fd_close()
++                    if attempt == 1:
++                        # 只重建目录（不递归审计、不取 records 锁 ⇒ 无锁环）
++                        _ensure_out_dir_raw('audit')
++            _AUDIT_DROPPED += 1
++            return None
++    except Exception:
++        try:
++            _AUDIT_DROPPED += 1
++        except Exception:
++            pass
++        return None
++
++
++def audit_read(path=None):
++    """读回审计事件（测试/诊断用；容忍最后一行半写）。"""
++    p = Path(path or AUDIT_FILE)
++    out = []
++    try:
++        with open(str(p), 'r', encoding='utf-8', errors='replace') as f:
++            for line in f:
++                line = line.strip()
++                if not line:
++                    continue
++                try:
++                    out.append(json.loads(line))
++                except ValueError:
++                    continue
++    except OSError:
++        return []
++    return out
++
++
++def audit_counts(path=None):
++    """事件名 → 条数（机器可读摘要）。"""
++    c = {}
++    for ev in audit_read(path):
++        name = ev.get('event') or '?'
++        c[name] = c.get(name, 0) + 1
++    return c
++
++
++# ---------------------------------------------------------------------------
++# F3：output 目录消失 → 检测 + 重建 + 审计（不打死长程任务）
++# ---------------------------------------------------------------------------
++def _ensure_out_dir_raw(where='unknown'):
++    """只做「检测 + 重建 + 世代推进」（无审计、无 log、可在任意锁内调用）。"""
++    global _OUT_DIR_EPOCH
++    try:
++        if OUT.is_dir():
++            return False
++    except OSError:
++        pass
++    with _OUT_DIR_LOCK:
++        try:
++            if OUT.is_dir():
++                return False
++            OUT.mkdir(parents=True, exist_ok=True)
++            _OUT_DIR_EPOCH += 1
++        except Exception as e:
++            try:
++                sys.stderr.write(f"[r3] output 目录重建失败（where={where}, path={OUT}）："
++                                 f"{type(e).__name__}: {e}\n")
++            except Exception:
++                pass
++            return False
++    return True
++
++
++def _note_dir_recreated(where, ep=None):
++    """重建通告（审计 + 日志 + stdout）。可在任意锁内安全调用。
++
++    不取 LOG_LOCK（log() 的异常分支会回调到这里，LOG_LOCK 不可重入），
++    改用单次 O_APPEND os.write 直写日志：小写入在 O_APPEND 下原子，最坏只是行序交错。"""
++    ep = _OUT_DIR_EPOCH if ep is None else ep
++    audit_event('output_dir_recreated', 'process',
++                {'where': where, 'path': str(OUT), 'epoch': ep})
++    line = (f"[{datetime.now().strftime('%H:%M:%S')}] [r3] output 目录消失 → 已重建"
++            f"（where={where}, path={OUT}, epoch={ep}）\n")
++    try:
++        fd = os.open(str(LOG_FILE), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
++        try:
++            _write_all(fd, line.encode('utf-8'))
++        finally:
++            os.close(fd)
++    except OSError:
++        pass
++    try:
++        sys.stdout.write(line)
++        sys.stdout.flush()
++    except Exception:
++        pass
++
++
++def ensure_out_dir(where='unknown'):
++    """公开入口：重建 + `output_dir_recreated` 审计 + stdout 通告。返回 True=本次做了重建。
++
++    注意：**不调用 log()**（log() 的异常分支会回调到这里；LOG_LOCK 不可重入）。"""
++    if not _ensure_out_dir_raw(where):
++        return False
++    _note_dir_recreated(where)
++    return True
++
++
++# ---------------------------------------------------------------------------
++# F2：get_total 调用侧容错（HTTP 200 但响应缺 'info' → 原实现 d['info'] KeyError）
++#   说明：get_total/fetch 属 impl-retry 区域，本 slot **不改其函数体**；
++#   容错落在调用侧（probe_children / recheck_chars / 条目 total 解析 / main 基线）。
++#   语义：None 一律表示「未定论」（未测到），绝不表示「0 条」（0 是确证的合法读数）。
++# ---------------------------------------------------------------------------
++def _classify_exc(e):
++    """错误四分类的**类**判定（D2 的 R3 侧最小实现，供 audit 与后续 R4 复用）。"""
++    if isinstance(e, (KeyError, TypeError, ValueError, AttributeError, IndexError)):
++        return 'malformed_response'          # 200 但结构不符（缺 info 等）
++    if isinstance(e, OSError) or type(e).__name__ in (
++            'ConnectionError', 'Timeout', 'ReadTimeout', 'ConnectTimeout',
++            'ChunkedEncodingError', 'SSLError', 'ProxyError', 'NewConnectionError'):
++        return 'network'
++    return 'unexpected'
++
++
++def _audit_exc(e, where, prefix=None):
++    """异常分类审计：同一 (class, where) 只写前 CLASSIFY_AUDIT_MAX 条，之后只计数。"""
++    cls = _classify_exc(e)
++    key = (cls, where)
++    with _AUDIT_LOCK:
++        _CLASSIFY_SEEN[key] = _CLASSIFY_SEEN.get(key, 0) + 1
++        n = _CLASSIFY_SEEN[key]
++    if n <= CLASSIFY_AUDIT_MAX:
++        audit_event('error_classified', 'request',
++                    {'class': cls, 'action': 'degrade', 'where': where, 'prefix': prefix,
++                     'exc': f'{type(e).__name__}: {e}', 'occurrence': n})
++    return cls
++
++
++def _safe_get_total(prefix, sort=None, where='probe'):
++    """get_total 的容错包装（F2）：任何异常 ⇒ 审计 + 返回 None（未定论），绝不外抛。"""
++    try:
++        return get_total(prefix, sort)
++    except Exception as e:
++        _audit_exc(e, where, prefix)
++        log(f"    [r3] get_total 异常（{where} {prefix!r}）：{type(e).__name__}: {e} → 记为未定论")
++        return None
++
++
++class ProbeOutcome(tuple):
++    """probe_children 的返回值（C2/F1）。
++
++    **向后兼容**：仍是 2 元组 `(kids, chars_to_recheck)`，旧调用点
++    `kids, zero_chars = probe_children(p)` 行为逐字不变；
++    新增 `.meta` 承载「全灭 / 未定论」判据，供块级兜底与审计使用。"""
++
++    def __new__(cls, kids, recheck, meta=None):
++        obj = super().__new__(cls, (kids, recheck))
++        obj.meta = dict(meta or {})
++        return obj
++
++    @property
++    def kids(self):
++        return self[0]
++
++    @property
++    def recheck_chars(self):
++        return self[1]
++
++    @property
++    def all_dead(self):
++        return bool(self.meta.get('all_dead'))
++
++    @property
++    def incomplete(self):
++        return bool(self.meta.get('incomplete'))
++
++    @property
++    def failed_chars(self):
++        return list(self.meta.get('failed_chars') or [])
++
++    @property
++    def zero_chars(self):
++        return list(self.meta.get('zero_chars') or [])
++
++
++def _probe_outcome_from_exc(prefix, e):
++    """探测**整体**异常（池级）时构造"全灭"结论：子树的分布未知 ⇒ 未定论，不丢。"""
++    _audit_exc(e, 'probe_children.pool', prefix)
++    meta = {'prefix': prefix, 'attempted': len(CHARSET), 'kids': 0, 'resolved': 0,
++            'zero_chars': [], 'failed_chars': sorted(CHARSET), 'rounds': 0,
++            'all_dead': True, 'incomplete': True, 'exc': f'{type(e).__name__}: {e}'}
++    audit_event('probe_all_dead', 'block',
++                {'prefix': prefix, 'missing_chars': sorted(CHARSET),
++                 'attempted': len(CHARSET), 'rounds': 0,
++                 'reason': f'probe_exception:{type(e).__name__}'})
++    return ProbeOutcome([], sorted(CHARSET), meta)
++
++
+ def probe_children(prefix):
++    """一阶子块探测（v9 语义保留：最多 3 轮 + 失败轮后 cooldown/sleep 30s）。
++
++    R3 增补（C2/F1/F2）：
++      · 三种结局明确区分：命中(t>0) / **确证为空**(t==0) / **未定论**(None 或抛异常)；
++        只有「命中 + 确证为空」算已定论，未定论字符一律留在 failed 集里；
++      · 字符级异常兜住（F2：HTTP 200 缺 info 的 KeyError 不再穿出探测池）；
++      · 全灭（无任何命中、无任何确证为空、全部未定论）⇒ 写 `probe_all_dead` 审计并打标记，
++        由调用方走块级兜底阶梯（重试轮 → 降级 + 修复轮），**不再静默丢子树**；
++      · 返回 ProbeOutcome（2 元组兼容 + .meta 判据）。
++    """
+     results = {}
+     pending = set(CHARSET)
+     zero_chars = set()
+-    for rnd in range(3):
++    rounds_done = 0
++
++    def probe(c):
++        try:
++            return c, get_total(prefix + c), None
++        except Exception as e:                       # F2：字符级兜住
++            _audit_exc(e, 'probe_children', prefix + c)
++            return c, None, f'{type(e).__name__}: {e}'
++
++    for rnd in range(PROBE_ROUNDS):
+         if not pending:
+             break
++        rounds_done = rnd + 1
+         to_probe = sorted(pending)
+         pending = set()
+         failed_now = set()
+-        def probe(c):
+-            t = get_total(prefix + c)
+-            return c, t
+         with ThreadPoolExecutor(max_workers=effective_workers('probe')) as ex:
+             futs = [ex.submit(probe, c) for c in to_probe]
+             for fut in as_completed(futs):
+-                c, t = fut.result()
++                try:
++                    c, t, _err = fut.result()
++                except Exception as e:               # 池级异常（极端）：整轮视为未定论
++                    _audit_exc(e, 'probe_children.pool', prefix)
++                    failed_now.update(to_probe)
++                    break
+                 if t is None:
+                     failed_now.add(c)
+                 elif t > 0:
+@@ -1714,10 +2190,324 @@
+         if pending:
+             log(f"    探测失败 {len(pending)} 字符，30s 后重试（轮 {rnd+1}）")
+             LIMITER.cooldown(30); time.sleep(30)
+-    return sorted(results.items()), sorted(zero_chars | pending)
++
++    attempted = len(CHARSET)
++    all_dead = (not results) and (not zero_chars) and bool(pending)
++    incomplete = bool(pending)
++    meta = {'prefix': prefix, 'attempted': attempted, 'kids': len(results),
++            'resolved': len(results) + len(zero_chars),
++            'zero_chars': sorted(zero_chars), 'failed_chars': sorted(pending),
++            'rounds': rounds_done, 'all_dead': all_dead, 'incomplete': incomplete,
++            'covered': sum(results.values())}
++    if all_dead:
++        audit_event('probe_all_dead', 'block',
++                    {'prefix': prefix, 'missing_chars': sorted(pending),
++                     'attempted': attempted, 'rounds': rounds_done,
++                     'reason': 'all_chars_unresolved'})
++        log(f"    [r3] 探测全灭 {prefix!r}：{len(pending)}/{attempted} 字符全部未定论"
++            f"（{rounds_done} 轮）→ 块级兜底阶梯接手")
++    elif incomplete:
++        audit_event('probe_incomplete', 'block',
++                    {'prefix': prefix, 'missing_chars': sorted(pending),
++                     'attempted': attempted, 'rounds': rounds_done,
++                     'resolved_chars': meta['resolved'], 'kids': meta['kids']})
++    return ProbeOutcome(sorted(results.items()), sorted(zero_chars | pending), meta)
++
++
++def _probe_dead_policy(item, outcome):
++    """块级兜底阶梯的**纯决策**部分（两套主循环共用，无 IO）。
++
++    返回 {'action': 'proceed'|'retry'|'degrade', 'retry_n', 'reason', 'delay_s', 'failed_chars'}"""
++    if outcome is None or not getattr(outcome, 'incomplete', False):
++        return {'action': 'proceed', 'retry_n': int(item.get('probe_dead', 0) or 0),
++                'reason': None, 'delay_s': 0.0, 'failed_chars': []}
++    n = int(item.get('probe_dead', 0) or 0)
++    kind = 'probe_all_dead' if outcome.all_dead else 'probe_incomplete'
++    if n < PROBE_DEAD_RETRY_MAX:
++        return {'action': 'retry', 'retry_n': n + 1, 'reason': kind,
++                'delay_s': PROBE_DEAD_DELAY_S, 'failed_chars': outcome.failed_chars}
++    return {'action': 'degrade', 'retry_n': n, 'reason': kind,
++            'delay_s': 0.0, 'failed_chars': outcome.failed_chars}
++
++
++def _find_degraded_gap(prog, prefix):
++    """找出该 prefix 已登记的未消解降级缺口（跨 pass/跨进程仍可用，靠 progress.gaps 反查）。"""
++    for g in (prog.get('gaps') or []):
++        if g.get('p') == prefix and g.get('degraded') and not g.get('resolved'):
++            return g
++    return None
++
++
++def _probe_dead_degrade(prog, item, prefix, total, outcome, pre, kids):
++    """降级记账（C2）：**不丢子树** —— 未定论字符登记为「未决缺口」进修复轮。
++
++    父块自身页已由"先抓一笔"（数据保险）落盘；已命中的子块照常入队；
++    未定论部分无法证明已覆盖 ⇒ 必须留缺口，收敛判据据此拒绝 exit 0（F1）。"""
++    fail_chars = outcome.failed_chars or list(CHARSET)
++    known = sum(t for _, t in kids)
++    reason = 'probe_all_dead' if outcome.all_dead else 'probe_incomplete'
++    gap_rec = {'p': prefix, 'total': total, 'covered': known,
++               'gap': max(0, int(total) - known), 'chars': fail_chars, 'type': 'branch',
++               'probe_dead': int(item.get('probe_dead', 0) or 0),
++               'degraded': True, 'repair_attempts': 0,
++               'ts': datetime.now().isoformat(), 'reason': reason}
++    prog.setdefault('gaps', []).append(gap_rec)
++    led = prog.setdefault('probe_dead', [])
++    led.append({'p': prefix, 'ts': gap_rec['ts'], 'reason': reason,
++                'failed_chars': fail_chars, 'attempts': gap_rec['probe_dead'], 'pre': pre})
++    if len(led) > 200:
++        del led[:-200]
++    _recovery_note(prog, 'probe-dead-degrade', prefix,
++                   f"探测未定论 {len(fail_chars)}/{len(CHARSET)} 字符（重试 {gap_rec['probe_dead']} 轮后）"
++                   f"→ 降级：保留已命中子块 {len(kids)} 个 + 父块自身页 {pre} 条，"
++                   f"未定论子树登记为未决缺口进修复轮")
++    audit_event('repair_round_enter', 'block',
++                {'reason': reason, 'prefix': prefix,
++                 'todo_snapshot': len(prog.get('todo') or []),
++                 'missing_chars': fail_chars, 'attempts': gap_rec['probe_dead']})
++    return gap_rec
++
++
++# ---------------------------------------------------------------------------
++# F5：停滞判据（水位/进度年龄阈值 → stall_detected 审计；可选超阈值自停）
++# ---------------------------------------------------------------------------
++def progress_watermark(prog):
++    """进度水位（任一维变化即算"有进展"）。
++
++    只用**单调/语义明确**的量：已抓记录数（stats.records 单调增）、完成叶子数、
++    done 账本长度、todo 长度（取负号：收缩=进展，分支展开=任务变多不算进展）、
++    gaps / recovery 长度。刻意不用 todo 长度本身 —— 分支展开会让它变大。"""
++    st = prog.get('stats') or {}
++    try:
++        return (int(st.get('records', 0) or 0),
++                int(st.get('leaves', 0) or 0),
++                len(prog.get('done') or []),
++                -len(prog.get('todo') or []),
++                len(prog.get('gaps') or []),
++                len(prog.get('recovery') or []))
++    except (TypeError, ValueError):
++        return None
++
++
++def stall_state(prog=None, now=None):
++    """当前停滞读数（结构化，测试与哈希读数用）。"""
++    now = now if now is not None else time.time()
++    last = _PROGRESS_STATE.get('last_change_ts')
++    age = None if last is None else max(0.0, now - last)
++    return {'age_s': age, 'watermark': _PROGRESS_STATE.get('watermark'),
++            'audited': bool(_PROGRESS_STATE.get('stall_audited')),
++            'stopped': bool(_PROGRESS_STATE.get('stall_stop_fired')),
++            'ticks': _PROGRESS_STATE.get('ticks', 0),
++            'threshold_s': STALL_PROGRESS_AGE_S, 'stop_threshold_s': STALL_STOP_AGE_S,
++            'action': STALL_ACTION, 'todo': len((prog or {}).get('todo') or [])}
++
++
++def stall_tick(prog, where='periodic'):
++    """停滞检查（幂等、永不抛异常）：水位变化 ⇒ 复位年龄；跨阈值 ⇒ stall_detected。
++
++    默认动作 = 只审计（audit）；SCRAPE_STALL_ACTION=stop 时超过自停阈值执行
++    graceful_stop（存 checkpoint + 审计 + exit EXIT_STALL_STOP）。"""
++    _PROGRESS_STATE['ticks'] = _PROGRESS_STATE.get('ticks', 0) + 1
++    now = time.time()
++    wm = progress_watermark(prog)
++    prev = _PROGRESS_STATE.get('watermark')
++    if _PROGRESS_STATE.get('last_change_ts') is None or (wm is not None and wm != prev):
++        _PROGRESS_STATE['watermark'] = wm
++        _PROGRESS_STATE['last_change_ts'] = now
++        if _PROGRESS_STATE.get('stall_audited') and prev is not None and wm != prev:
++            _PROGRESS_STATE['stall_audited'] = False       # 恢复后重新武装
++            audit_event('stall_cleared', 'block',
++                        {'where': where, 'watermark': list(wm) if wm else None})
++        return {'stalled': False, 'age_s': 0.0, 'action': None}
++    age = now - _PROGRESS_STATE['last_change_ts']
++    st = stall_state(prog, now)
++    out = {'stalled': False, 'age_s': round(age, 3), 'action': None}
++    if age >= STALL_PROGRESS_AGE_S and not _PROGRESS_STATE.get('stall_audited'):
++        _PROGRESS_STATE['stall_audited'] = True
++        detail = {'kind': 'progress_age', 'last_progress_age_s': round(age, 3),
++                  'where': where, 'threshold_s': STALL_PROGRESS_AGE_S,
++                  'action': STALL_ACTION, 'watermark': list(wm) if wm else None,
++                  'todo': st['todo'], 'gaps': len(prog.get('gaps') or [])}
++        audit_event('stall_detected', 'block', detail)
++        log(f"    [r3] 停滞判据命中：进度年龄 {age:.1f}s ≥ {STALL_PROGRESS_AGE_S:.0f}s"
++            f"（where={where}, todo={st['todo']}, action={STALL_ACTION}）")
++        out = {'stalled': True, 'age_s': round(age, 3), 'action': 'audit'}
++    if (STALL_ACTION == 'stop' and age >= STALL_STOP_AGE_S
++            and not _PROGRESS_STATE.get('stall_stop_fired')):
++        _PROGRESS_STATE['stall_stop_fired'] = True
++        audit_event('stall_detected', 'block',
++                    {'kind': 'progress_age_stop', 'last_progress_age_s': round(age, 3),
++                     'where': where, 'threshold_s': STALL_STOP_AGE_S,
++                     'action': 'stop', 'todo': st['todo']})
++        graceful_stop(prog, signal_name='stall', exit_code=EXIT_STALL_STOP,
++                      extra={'age_s': round(age, 3), 'where': where})
++        out = {'stalled': True, 'age_s': round(age, 3), 'action': 'stop'}
++    return out
++
++
++def graceful_stop(prog, signal_name='stall', exit_code=EXIT_STALL_STOP, extra=None):
++    """优雅自停：存 checkpoint（progress + 待写 records）→ 审计 → 退出。
++
++    与「进程被杀」的区别：progress.json 与 records.jsonl 都已落盘且相互一致。"""
++    try:
++        rc_flush = flush_pending_records()
++    except Exception:
++        rc_flush = -1
++    try:
++        save_progress(prog)
++    except Exception:
++        pass
++    d = {'signal': signal_name, 'todo': len(prog.get('todo') or []),
++         'done': len(prog.get('done') or []), 'exit_code': exit_code,
++         'pending_records': rc_flush if isinstance(rc_flush, int) else 'unknown'}
++    if extra:
++        d.update(extra)
++    audit_event('graceful_stop', 'process', d)
++    try:
++        log(f"[r3] 优雅自停（signal={signal_name}）：checkpoint 已落盘，exit {exit_code} {d}")
++    except Exception:
++        pass
++    try:
++        sys.stdout.flush(); sys.stderr.flush()
++    except Exception:
++        pass
++    os._exit(int(exit_code))
++
++
++def _stall_monitor_loop(prog):
++    stop = _STALL_THREAD.get('stop')
++    while stop is not None and not stop.wait(STALL_CHECK_EVERY_S):
++        try:
++            stall_tick(prog, 'monitor')
++        except Exception as e:
++            try:
++                log(f"[r3] 停滞监测异常（已忽略，监测继续）: {type(e).__name__}: {e}")
++            except Exception:
++                pass
++
++
++def _stall_monitor_start(prog):
++    """独立监测线程：即使全部工作线程阻塞在 fetch 里，停滞判据仍然生效。"""
++    if not STALL_MONITOR_ENABLED:
++        return None
++    if _STALL_THREAD.get('t') is not None and _STALL_THREAD['t'].is_alive():
++        return _STALL_THREAD['t']
++    _STALL_THREAD['stop'] = threading.Event()
++    t = threading.Thread(target=_stall_monitor_loop, args=(prog,),
++                         name='r3-stall-monitor', daemon=True)
++    _STALL_THREAD['t'] = t
++    t.start()
++    return t
++
++
++def _stall_monitor_stop():
++    ev = _STALL_THREAD.get('stop')
++    if ev is not None:
++        ev.set()
++    t = _STALL_THREAD.get('t')
++    if t is not None and t.is_alive():
++        t.join(timeout=1.0)
++    _STALL_THREAD['t'] = None
++
++
++# ---------------------------------------------------------------------------
++# F6/F1：收敛判据机器化（结构化报告 + 退出码 + convergence_decision 审计）
++# ---------------------------------------------------------------------------
++def open_gaps(prog):
++    """未决缺口（resolved 标记为真的条目视为已消解）。"""
++    return [g for g in (prog.get('gaps') or []) if not g.get('resolved')]
++
++
++def convergence_decision(prog, round_num, fixed=0, remaining=0):
++    """机器化收敛判据。返回 (decided, terminal, exit_code, reason, detail)。
++
++    decided ∈ {'done','continue'}（与 R3 审计 schema 的枚举一致）；
++    terminal=True 表示主循环可以结束，此时 exit_code 就是**机器结论**：
++      0 = 收敛；EXIT_INCOMPLETE = 未收敛（todo 空但仍有未决缺口且修复预算耗尽）。"""
++    todo = len(prog.get('todo') or [])
++    gaps = open_gaps(prog)
++    degraded = [g for g in gaps if g.get('degraded')]
++    terminal_gaps = [g for g in gaps if g.get('terminal')]
++    attempts = [int(g.get('repair_attempts', 0) or 0) for g in gaps] or [0]
++    detail = {'todo': todo, 'gaps': len(gaps), 'degraded_gaps': len(degraded),
++              'terminal_gaps': len(terminal_gaps), 'repair_attempts_max': max(attempts),
++              'repair_attempts_budget': GAP_REPAIR_MAX,
++              'done': len(prog.get('done') or []),
++              'records': int((prog.get('stats') or {}).get('records', 0) or 0),
++              'probe_dead': len(prog.get('probe_dead') or []),
++              'round': round_num, 'fixed_last_round': fixed,
++              'remaining_last_round': remaining,
++              'round_max': MAX_ROUNDS}
++    if todo > 0:
++        return 'continue', False, None, 'todo-pending', detail
++    if not gaps:
++        return 'done', True, EXIT_CONVERGED, 'no-todo-no-open-gaps', detail
++    if fixed > 0:
++        return 'continue', False, None, 'repair-progress', detail
++    if len(terminal_gaps) == len(gaps):
++        return 'continue', True, EXIT_INCOMPLETE, 'repair-budget-exhausted', detail
++    return 'continue', False, None, 'repair-budget-left', detail
++
++
++def write_convergence_report(prog, decided, terminal, exit_code, reason, detail, extra=None):
++    """写 OUT/convergence-report.json（原子替换；失败只告警，不影响主流程）。"""
++    global LAST_CONVERGENCE
++    rep = {'schema': 'r3-convergence-v1', 'ts': round(time.time(), 3),
++           'ts_iso': datetime.now().isoformat(timespec='milliseconds'),
++           'pid': os.getpid(), 'run': _r3_run_id(),
++           'decided': decided, 'terminal': bool(terminal),
++           'exit_code': exit_code, 'reason': reason, 'detail': detail,
++           'gaps': [{'p': g.get('p'), 'type': g.get('type'), 'total': g.get('total'),
++                     'covered': g.get('covered'), 'got': g.get('got'), 'gap': g.get('gap'),
++                     'degraded': bool(g.get('degraded')),
++                     'repair_attempts': g.get('repair_attempts', 0),
++                     'terminal': bool(g.get('terminal')),
++                     'missing_chars': len(g.get('chars') or [])}
++                    for g in (prog.get('gaps') or [])],
++           'probe_dead': [{'p': e.get('p'), 'reason': e.get('reason'),
++                           'attempts': e.get('attempts'),
++                           'missing_chars': len(e.get('failed_chars') or [])}
++                          for e in (prog.get('probe_dead') or [])][-50:],
++           'stats': dict(prog.get('stats') or {}),
++           'audit_counts': audit_counts(),
++           'audit_dropped': _AUDIT_DROPPED,
++           'records_deferred': _RECORDS_DEFERRED,
++           'recovery_tail': (prog.get('recovery') or [])[-10:]}
++    if extra:
++        rep.update(extra)
++    LAST_CONVERGENCE = rep
++    blob = (json.dumps(rep, ensure_ascii=False, indent=1) + '\n').encode('utf-8')
++    tmp = CONV_REPORT_FILE.with_name(f"convergence-report.json.tmp.{os.getpid()}")
++    try:
++        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
++        try:
++            _write_all(fd, blob)
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++        os.replace(str(tmp), str(CONV_REPORT_FILE))
++    except OSError as e:
++        ensure_out_dir('convergence-report')
++        try:
++            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
++            try:
++                _write_all(fd, blob)
++                os.fsync(fd)
++            finally:
++                os.close(fd)
++            os.replace(str(tmp), str(CONV_REPORT_FILE))
++        except OSError as e2:
++            audit_event('convergence_report_failed', 'process',
++                        {'err': f'{type(e2).__name__}: {e2}',
++                         'first_err': f'{type(e).__name__}: {e}'})
++    return rep
++
+ 
+ def recheck_chars(parent, chars, gap_target, max_chars=15, miss_limit=5, pause=0.5):
+-    """v9: 每字符的双排序查询并行（去字符内 pause）。返回发现的 (sub,total)。"""
++    """v9: 每字符的双排序查询并行（去字符内 pause）。返回发现的 (sub,total)。
++
++    R3·slot-converge (F2)：get_total 换成容错包装 _safe_get_total ⇒
++    HTTP 200 缺 info 的 KeyError 记为「未定论」（不计命中、不打断复验循环）。"""
+     found = []
+     misses = 0
+     for c in chars:
+@@ -1727,9 +2517,13 @@
+             break
+         sub = parent + c
+         with ThreadPoolExecutor(max_workers=2) as ex:
+-            f1 = ex.submit(get_total, sub)
+-            f2 = ex.submit(get_total, sub, "title")
+-            t1 = f1.result(); t2 = f2.result()
++            f1 = ex.submit(_safe_get_total, sub, None, 'recheck')
++            f2 = ex.submit(_safe_get_total, sub, "title", 'recheck')
++            try:
++                t1 = f1.result(); t2 = f2.result()
++            except Exception as e:                   # 池级异常兜底（双保险）
++                _audit_exc(e, 'recheck.pool', sub)
++                t1 = t2 = None
+         t = max(t1 or 0, t2 or 0)
+         if t > 0:
+             found.append((sub, t))
+@@ -1961,6 +2755,10 @@
+ 
+ def _conc_log_periodic(q, budget, wid):
+     global _CONC_LAST_LOG
++    try:                                   # R3·F5：并发路径也采样进度水位（监测线程之外的补充）
++        stall_tick(q.prog, 'conc-periodic')
++    except Exception:
++        pass
+     now = time.time()
+     with _CONC_LOG_LOCK:
+         if now - _CONC_LAST_LOG < W_LOG_EVERY_S:
+@@ -2037,6 +2835,8 @@
+     # ---- 3) 分支（基线 L952-1012）----
+     t0 = item.get('t0') or time.time()
+     item['t0'] = t0
++    degraded_gap = (_find_degraded_gap(prog, prefix) if item.get('degraded') else None)
++    # ↑ R3·C2：本条目已被降级过 ⇒ 复用已登记缺口（当场复验 pass 不再重复登记）
+     if item.get('stage') == 'recheck':
+         # 第二段：冷却窗口已过（期间工作槽已交还），执行「大缺口当场复验」（基线 L983-989）
+         kids = item.get('kids') or []
+@@ -2069,12 +2869,31 @@
+                     log(f"    先抓异常 {prefix!r}: {e}")
+                     ok, pre = False, 0
+             try:
+-                kids, zero_chars = f_probe.result()
+-            except Exception as e:
++                probe_out = f_probe.result()            # R3: ProbeOutcome（仍是 2 元组）
++                kids, zero_chars = probe_out
++            except Exception as e:                      # R3·C2: 探测整体异常 ⇒ 未定论，不丢子树
+                 log(f"    探测异常 {prefix!r}: {e}")
+-                kids, zero_chars = [], []
++                probe_out = _probe_outcome_from_exc(prefix, e)
++                kids, zero_chars = probe_out
+         if pre > 0:
+             log(f"    先抓 {prefix!r}: {pre} 条落盘")
++        # ---- R3·C2/F1：块级兜底阶梯（探测全灭/未定论 ⇒ 重试轮 → 降级 + 修复轮）----
++        pol = _probe_dead_policy(item, probe_out)
++        if pol['action'] == 'retry':
++            item['probe_dead'] = pol['retry_n']
++            log(f"    [r3] 探测未定论 {len(pol['failed_chars'])} 字符（{pol['reason']}）"
++                f"→ 父块重试轮 #{pol['retry_n']}/{PROBE_DEAD_RETRY_MAX}，"
++                f"{pol['delay_s']:.0f}s 后重排（不丢子树）")
++            audit_event('probe_retry', 'block',
++                        {'prefix': prefix, 'reason': pol['reason'],
++                         'attempt': pol['retry_n'], 'max_attempts': PROBE_DEAD_RETRY_MAX,
++                         'missing_chars': pol['failed_chars'], 'delay_s': pol['delay_s'],
++                         'todo_snapshot': len(prog.get('todo') or [])})
++            _conc_defer(q, item, pol['delay_s'], prefix)
++            return
++        if pol['action'] == 'degrade':
++            degraded_gap = _probe_dead_degrade(prog, item, prefix, total, probe_out, pre, kids)
++            item['degraded'] = True          # 标记：后续 pass（当场复验）就地更新，不再新增缺口
+         covered = sum(t for _, t in kids)
+         gap = total - covered
+         # 大缺口 → 当场复验。基线在此 cooldown(20)+sleep(20)（占槽）；
+@@ -2101,8 +2920,15 @@
+     item.pop('stage', None)
+     with q.lock:
+         if gap > max(GAP_TRIGGER, int(total * 0.02)):
+-            prog['gaps'].append({'p': prefix, 'total': total, 'covered': covered,
+-                                 'gap': gap, 'chars': zero_chars, 'type': 'branch'})
++            if degraded_gap is not None:
++                # R3·C2：降级缺口已在 _probe_dead_degrade 登记（含 failed_chars 与预算计数）；
++                # 当场复验后的覆盖数就地更新，避免同一 prefix 出现两条缺口（重复计数）。
++                degraded_gap['covered'] = covered
++                degraded_gap['gap'] = gap
++            else:
++                prog['gaps'].append({'p': prefix, 'total': total, 'covered': covered,
++                                     'gap': gap, 'chars': zero_chars, 'type': 'branch',
++                                     'repair_attempts': 0})
+         skipped_kids = 0
+         for s, t in reversed(kids):
+             if is_recorded_done(s, t):        # v10: 该子叶已落盘 → 不入队，避免重复抓取
+@@ -2185,14 +3011,22 @@
+ 
+ 
+ def _serial_process_queue(prog):
+-    """基线串行主循环（v10.1 逐行保留）：SCRAPE_CONC=0 时使用的回滚/对照形态。"""
++    """基线串行主循环（v10.1 逐行保留）：SCRAPE_CONC=0 时使用的回滚/对照形态。
++
++    R3·slot-converge 在本路径的改动与并发路径**逐条对应**：
++      (1) total 解析用 _safe_get_total（F2）；(2) 块级兜底阶梯（C2/F1）；
++      (3) 停滞水位采样（F5）。"""
+     todo = prog['todo']
+     while todo:
++        try:                                   # R3·F5：串行路径也采样进度水位
++            stall_tick(prog, 'serial')
++        except Exception:
++            pass
+         item = todo[0]
+         prefix = item['p']
+         total = item.get('total')
+         if total is None:
+-            t = get_total(prefix)
++            t = _safe_get_total(prefix, None, 'serial-item-total')      # R3·F2
+             if t is None:
+                 log(f"探测失败 {prefix!r}，跳过")
+                 todo.pop(0); save_progress(prog, prefix); continue
+@@ -2253,12 +3087,34 @@
+                         log(f"    先抓异常 {prefix!r}: {e}")
+                         ok, pre = False, 0
+                 try:
+-                    kids, zero_chars = f_probe.result()
+-                except Exception as e:
++                    probe_out = f_probe.result()        # R3: ProbeOutcome（仍是 2 元组）
++                    kids, zero_chars = probe_out
++                except Exception as e:                  # R3·C2: 探测整体异常 ⇒ 未定论，不丢子树
+                     log(f"    探测异常 {prefix!r}: {e}")
+-                    kids, zero_chars = [], []
++                    probe_out = _probe_outcome_from_exc(prefix, e)
++                    kids, zero_chars = probe_out
+             if pre > 0:
+                 log(f"    先抓 {prefix!r}: {pre} 条落盘")
++            # ---- R3·C2/F1：块级兜底阶梯（探测全灭/未定论 ⇒ 重试轮 → 降级 + 修复轮）----
++            pol = _probe_dead_policy(item, probe_out)
++            if pol['action'] == 'retry':
++                item['probe_dead'] = pol['retry_n']
++                log(f"    [r3] 探测未定论 {len(pol['failed_chars'])} 字符（{pol['reason']}）"
++                    f"→ 父块重试轮 #{pol['retry_n']}/{PROBE_DEAD_RETRY_MAX}，"
++                    f"{pol['delay_s']:.0f}s 后重排（不丢子树）")
++                audit_event('probe_retry', 'block',
++                            {'prefix': prefix, 'reason': pol['reason'],
++                             'attempt': pol['retry_n'], 'max_attempts': PROBE_DEAD_RETRY_MAX,
++                             'missing_chars': pol['failed_chars'], 'delay_s': pol['delay_s'],
++                             'todo_snapshot': len(prog.get('todo') or [])})
++                todo.append(todo.pop(0))            # = 基线回队尾
++                save_progress(prog, prefix)
++                LIMITER.cooldown(pol['delay_s']); time.sleep(pol['delay_s'])
++                continue
++            degraded_gap = None
++            if pol['action'] == 'degrade':
++                degraded_gap = _probe_dead_degrade(prog, item, prefix, total, probe_out, pre, kids)
++                item['degraded'] = True
+             covered = sum(t for _, t in kids)
+             gap = total - covered
+             # 3) 大缺口 → 当场复验
+@@ -2278,8 +3134,13 @@
+             item['covered'] = covered
+             item['gap'] = gap
+             if gap > max(GAP_TRIGGER, int(total * 0.02)):
+-                prog['gaps'].append({'p': prefix, 'total': total, 'covered': covered,
+-                                     'gap': gap, 'chars': zero_chars, 'type': 'branch'})
++                if degraded_gap is not None:
++                    degraded_gap['covered'] = covered       # R3·C2：就地更新，不重复登记
++                    degraded_gap['gap'] = gap
++                else:
++                    prog['gaps'].append({'p': prefix, 'total': total, 'covered': covered,
++                                         'gap': gap, 'chars': zero_chars, 'type': 'branch',
++                                         'repair_attempts': 0})
+             todo.pop(0)
+             skipped_kids = 0
+             for s, t in reversed(kids):
+@@ -2296,17 +3157,39 @@
+             save_progress(prog, prefix)
+ 
+ def final_recheck_round(prog):
+-    """终局修复轮：对全部遗留 gaps 慢速重修。返回 (修复数, 仍缺数)"""
++    """终局修复轮：对全部遗留 gaps 慢速重修。返回 (修复数, 仍缺数)。
++
++    R3·slot-converge（F1/C2）：
++      · 每个缺口带 repair_attempts 预算（GAP_REPAIR_MAX）；预算用尽且仍未补齐 ⇒ 标
++        terminal=True 并**保留在 gaps[]**（绝不静默丢弃 ⇒ 收敛判据会判"未收敛"）；
++      · 进入/退出修复轮写 repair_round_enter / repair_round_result / repair_exhausted 审计；
++      · 修复结果结构化落到 LAST_REPAIR_SUMMARY（供收敛报告与测试读数）。"""
++    global LAST_REPAIR_SUMMARY
+     gaps = prog.get('gaps', [])
+     if not gaps:
++        LAST_REPAIR_SUMMARY = {'entered': False, 'gaps_in': 0, 'fixed': 0,
++                               'remaining': 0, 'terminal': 0}
+         return 0, 0
+     fixed = 0
+     remaining = []
++    terminal = 0
+     log(f"=== 终局修复轮：{len(gaps)} 个遗留缺口 ===")
++    audit_event('repair_round_enter', 'block',
++                {'reason': 'final-recheck', 'todo_snapshot': len(prog.get('todo') or []),
++                 'gaps': len(gaps),
++                 'degraded': sum(1 for g in gaps if g.get('degraded')),
++                 'attempts_max': max([int(g.get('repair_attempts', 0) or 0) for g in gaps] or [0])})
+     for gap in gaps:
+         p = gap['p']
+         total = gap['total']
+         tol = max(2, int(total * 0.015))
++        kept = False                       # 本轮该缺口是否仍未补齐（留在 remaining）
++        if gap.get('terminal'):
++            # 预算已耗尽：不再重修，但**保留**在 gaps[]（收敛判据据此判未收敛）
++            remaining.append(gap)
++            terminal += 1
++            continue
++        gap['repair_attempts'] = int(gap.get('repair_attempts', 0) or 0) + 1
+         if gap.get('type') == 'leaf':
+             if is_recorded_done(p, total):        # v10: 反查已够 → 免重修
+                 fixed += 1
+@@ -2321,6 +3204,7 @@
+                 gap['got'] = max(gap.get('got', 0), got)
+                 log(f"  终局修复叶子 {p!r} 仍缺: {got}/{total}")
+                 remaining.append(gap)
++                kept = True
+         else:  # branch
+             chars = gap.get('chars', CHARSET)
+             if not chars:
+@@ -2337,13 +3221,37 @@
+                 gap['covered'] = cov
+                 if total - cov > max(GAP_TRIGGER, int(total * 0.02)):
+                     remaining.append(gap)
++                    kept = True
+                 else:
++                    gap['resolved'] = True
+                     log(f"  终局修复分支 {p!r} 已补齐（{cov}/{total}）")
+             else:
+                 remaining.append(gap)
++                kept = True
++        # 预算判定：本缺口已重修 GAP_REPAIR_MAX 次仍未补齐 ⇒ terminal（不再空转）
++        if kept and not gap.get('resolved') \
++                and int(gap.get('repair_attempts', 0) or 0) >= GAP_REPAIR_MAX:
++            gap['terminal'] = True
++            gap['terminal_reason'] = 'repair-budget-exhausted'
++            audit_event('repair_exhausted', 'block',
++                        {'prefix': gap.get('p'), 'type': gap.get('type'),
++                         'attempts': gap.get('repair_attempts'),
++                         'budget': GAP_REPAIR_MAX, 'total': total,
++                         'covered': gap.get('covered'), 'got': gap.get('got'),
++                         'degraded': bool(gap.get('degraded')),
++                         'missing_chars': len(gap.get('chars') or [])})
++            log(f"  [r3] 缺口 {gap.get('p')!r} 修复预算用尽"
++                f"（{gap['repair_attempts']}/{GAP_REPAIR_MAX}）→ 标 terminal："
++                f"收敛判据将判「未收敛」（不再空转，也不谎报完成）")
+     prog['gaps'] = remaining
++    terminal = sum(1 for g in remaining if g.get('terminal'))
+     save_progress(prog)
+-    log(f"  终局轮：修复 {fixed}，仍缺 {len(remaining)}")
++    LAST_REPAIR_SUMMARY = {'entered': True, 'gaps_in': len(gaps), 'fixed': fixed,
++                           'remaining': len(remaining), 'terminal': terminal}
++    audit_event('repair_round_result', 'block',
++                {'fixed': fixed, 'remaining': len(remaining), 'terminal': terminal,
++                 'gaps_in': len(gaps)})
++    log(f"  终局轮：修复 {fixed}，仍缺 {len(remaining)}（其中预算耗尽 terminal={terminal}）")
+     return fixed, len(remaining)
+ 
+ # ===========================================================================
+@@ -2383,7 +3291,7 @@
+             prog = rebuild_from_records(seeds, args)     # 兜底：全量反查 records 重建队列
+         else:
+             log(f"初始化队列，种子：{seeds}")
+-            baseline = get_total("")
++            baseline = _safe_get_total("", None, 'baseline')     # R3·F2：200-缺-info 不再崩启动
+             log(f"全量基线: {baseline}")
+             prog = {'todo': [{'p': s, 'total': None} for s in seeds],
+                     'stats': {'leaves': 0, 'records': 0},
+@@ -2396,6 +3304,9 @@
+         prog.setdefault('done', [])
+         prog.setdefault('recovery', [])
+         prog.setdefault(TAINT_KEY, [])
++        prog.setdefault('probe_dead', [])
++        for _g in (prog.get('gaps') or []):              # R3：老 progress 兼容（补预算计数）
++            _g.setdefault('repair_attempts', 0)
+         prog.setdefault('seeds', list(args) if args else list(string.ascii_uppercase))
+ 
+     reconcile(prog)                                     # v10: 启动先做一致性自愈
+@@ -2405,25 +3316,79 @@
+     log(f"[conc] 配置 CONC_ENABLED={CONC_ENABLED} W_MAX={W_MAX} W_MIN={W_MIN} "
+         f"ADAPTIVE={CONC_ADAPTIVE} SCALE_UP_AFTER={W_SCALE_UP_AFTER_S:.0f}s "
+         f"DEFER_SLOTS={CONC_DEFER_SLOTS}")
++    # R3·slot-converge：自愈/收敛判据配置单行可审计
++    log(f"[r3] 配置 audit={AUDIT_FILE.name} 探测重试≤{PROBE_DEAD_RETRY_MAX}({PROBE_DEAD_DELAY_S:.0f}s) "
++        f"缺口修复预算={GAP_REPAIR_MAX} 停滞阈值={STALL_PROGRESS_AGE_S:.0f}s/{STALL_STOP_AGE_S:.0f}s"
++        f"(action={STALL_ACTION}) 退出码 收敛={EXIT_CONVERGED} 未收敛={EXIT_INCOMPLETE} "
++        f"停滞自停={EXIT_STALL_STOP} 轮数上限={MAX_ROUNDS}")
++    audit_event('run_start', 'process',
++                {'seeds': prog.get('seeds'), 'todo': len(prog.get('todo') or []),
++                 'gaps': len(prog.get('gaps') or []), 'argv': sys.argv[1:],
++                 'out': str(OUT), 'baseline': prog.get('baseline'),
++                 'conc': {'enabled': CONC_ENABLED, 'w_max': W_MAX},
++                 'exit_codes': {'converged': EXIT_CONVERGED, 'incomplete': EXIT_INCOMPLETE,
++                                'stall_stop': EXIT_STALL_STOP}})
++    _stall_monitor_start(prog)                          # R3·F5：独立停滞监测线程
+     round_num = 0
+-    while True:
+-        round_num += 1
+-        log(f"--- 主循环第 {round_num} 轮 ---")
+-        process_queue(prog)
+-        fixed, remaining = final_recheck_round(prog)
+-        pending = len(prog['todo'])
+-        if pending == 0 and fixed == 0:
+-            log("收敛：无新任务且无修复进展，结束")
+-            break
+-        if round_num > 12:
+-            log("达最大轮数（12），停止")
+-            break
++    rc = EXIT_CONVERGED
++    try:
++        while True:
++            round_num += 1
++            log(f"--- 主循环第 {round_num} 轮 ---")
++            stall_tick(prog, 'round')                   # R3·F5：每轮至少采样一次水位
++            process_queue(prog)
++            fixed, remaining = final_recheck_round(prog)
++            decided, terminal, rc_c, reason, detail = convergence_decision(
++                prog, round_num, fixed, remaining)
++            audit_event('convergence_decision', 'block',
++                        dict(detail, decided=decided, reason=reason,
++                             terminal=bool(terminal), exit_code=rc_c))
++            write_convergence_report(prog, decided, terminal, rc_c, reason, detail)
++            if terminal:
++                rc = EXIT_CONVERGED if rc_c is None else rc_c
++                log(f"[r3] 收敛判据：decided={decided} terminal={terminal} reason={reason} "
++                    f"todo={detail['todo']} gaps={detail['gaps']} "
++                    f"terminal_gaps={detail['terminal_gaps']} → exit {rc}")
++                break
++            if round_num >= MAX_ROUNDS:
++                gaps_open = len(open_gaps(prog))
++                rc = EXIT_INCOMPLETE if gaps_open else EXIT_CONVERGED
++                detail2 = dict(detail, reason='max-rounds', max_rounds=MAX_ROUNDS)
++                audit_event('convergence_decision', 'block',
++                            dict(detail2, decided='continue', terminal=True, exit_code=rc))
++                write_convergence_report(prog, 'continue', True, rc, 'max-rounds', detail2)
++                log(f"[r3] 达最大轮数（{MAX_ROUNDS}）：未决缺口 {gaps_open} → exit {rc}")
++                break
++    finally:
++        _stall_monitor_stop()
+ 
+-    log(f"全部完成！stats={prog['stats']}")
++    try:                                                # R3·F3：收尾冲刷待写 records
++        left = flush_pending_records()
++    except Exception:
++        left = -1
++    if isinstance(left, int) and left > 0:
++        log(f"[r3] 收尾：仍有 {left} 条 records 未落盘（已审计 records_write_deferred）")
++        rc = EXIT_INCOMPLETE if rc == EXIT_CONVERGED else rc
++    gaps_left = open_gaps(prog)
++    if rc == EXIT_CONVERGED:
++        # 收敛：保留原「全部完成」字样（keeper-v2 的 JOB_COMPPAT 依赖），但结论以退出码为准
++        log(f"全部完成！stats={prog['stats']} 收敛判据=exit {EXIT_CONVERGED}"
++            f"（todo=0 gaps=0，报告={CONV_REPORT_FILE.name}）")
++    else:
++        # 未收敛：**刻意不打印「全部完成」** —— 字符串判据正是 F1/F6 要消灭的东西
++        log(f"未收敛（exit {rc}）：todo={len(prog['todo'])} 未决缺口={len(gaps_left)} "
++            f"stats={prog['stats']} → 详见 {CONV_REPORT_FILE.name} 与 {AUDIT_FILE.name}")
+     if prog['gaps']:
+         log(f"=== 最终遗留缺口 ({len(prog['gaps'])}) ===")
+         for g in prog['gaps']:
+             log(f"  {g}")
++    audit_event('run_end', 'process',
++                {'exit_code': rc, 'todo': len(prog.get('todo') or []),
++                 'gaps': len(gaps_left), 'done': len(prog.get('done') or []),
++                 'stats': dict(prog.get('stats') or {}),
++                 'audit_counts': audit_counts(), 'audit_dropped': _AUDIT_DROPPED,
++                 'records_deferred': _RECORDS_DEFERRED})
++    return rc
+ 
+ def _cli():
+     """--reconcile-only：只做 records 修复 + 反查重建，不抓取（供测试/运维离线使用）。
+@@ -2448,8 +3413,9 @@
+         save_progress(prog)
+         print(json.dumps({'ok': True, **st}, ensure_ascii=False))
+         return 0
+-    main()
+-    return 0
++    # R3·F6：main() 的返回码即收敛判据（0=收敛 / 3=未收敛 / 4=停滞自停），原样上抛
++    rc = main()
++    return rc if isinstance(rc, int) else 0
+ 
+ if __name__ == '__main__':
+     sys.exit(_cli())

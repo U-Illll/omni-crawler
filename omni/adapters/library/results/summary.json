@@ -1,0 +1,1179 @@
+{
+ "run_id": "drill-20260927T130041-32197",
+ "ts": "2026-09-27T13:01:07.032",
+ "system": {
+  "name": "baseline-r2cand",
+  "label": "R3 基线：R2 收口合成候选版（scrape-r2cand.py + memguard + heartbeat + keeper-v2.sh）",
+  "note": "R3 轮开始时的系统现状 = 修复前对照。keeper-v2 的审计是 keeper-audit/1 子集（无 level/seq/detail），audit-verify 会以 compat 适配器解析并单列 strict 偏差。",
+  "scrape": "/tmp/scrape-baseline.py",
+  "memguard": "/tmp/lib-opt-work/R3/refs/memguard.py",
+  "heartbeat": "/tmp/lib-opt-work/R3/refs/heartbeat.py",
+  "keeper": "/home/user/go/omni-crawler/omni/adapters/library/keeper-v3.sh",
+  "strict": [
+   "scrape",
+   "keeper"
+  ],
+  "job_name": "v8",
+  "complete_marker": "全部完成",
+  "keeper_tick": 5,
+  "recovery_deadline": 180,
+  "expected_audit": [
+   "out/audit.jsonl",
+   "audit.jsonl"
+  ],
+  "_file": "/home/user/go/omni-crawler/omni/adapters/library/systems/baseline-r2cand.json",
+  "_missing": [],
+  "_degraded": [],
+  "_ready": true,
+  "_hashes": {
+   "scrape": "f9559cb7c626",
+   "memguard": "84f75f167c16",
+   "heartbeat": "5e9a993ef86e",
+   "keeper": "2583db3c79a5"
+  }
+ },
+ "corpus": {
+  "records": 21600,
+  "depth": 2,
+  "fan": 3,
+  "dist": "zipf",
+  "len_tail": "1.0",
+  "lat_p50": 0.002,
+  "lat_sigma": 0.0,
+  "profile": "ideal"
+ },
+ "seeds": [
+  "A",
+  "B",
+  "C",
+  "D",
+  "E",
+  "F"
+ ],
+ "window": 150.0,
+ "deadline": 180,
+ "complete_run": true,
+ "reference": null,
+ "results": [
+  {
+   "scenario": "S1",
+   "title": "kill -9 循环 ×3 → 恢复时限 + 数据完整性（C3/A2）",
+   "system": "baseline-r2cand",
+   "run_id": "drill-20260927T130041-32197",
+   "started": "2026-09-27T13:00:41.772",
+   "t0": 1790485241.7727134,
+   "window_s": 150.0,
+   "deadline": 180,
+   "sandbox": {
+    "run_dir": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1",
+    "src_dir": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/src",
+    "out_dir": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out",
+    "work": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/work",
+    "bin": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/bin",
+    "state": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/state",
+    "drill_env": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/drill-env",
+    "fsize_file": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/drill-env/fsize_kb",
+    "scrape_copy": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/src/scrape_under_test.py",
+    "shim": "/home/user/go/omni-crawler/omni/adapters/library/drilllib/shim.py",
+    "wrapper": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/bin/run-scrape.sh",
+    "jobs_conf": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/jobs.conf",
+    "copied": {
+     "memguard": "memguard.py",
+     "heartbeat": "heartbeat.py"
+    },
+    "scrape_src": "/tmp/scrape-baseline.py",
+    "scrape_src_sha256": "f9559cb7c626406d6611998cbb9ce5850dfb6bd03bf37b75cc4405cd33184265",
+    "scrape_copy_sha256": "28be0ec3d651fab942bd8679cca62e3c6df67c99d6eee1b3523bd4109a7f4b1f",
+    "audit": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/audit.jsonl",
+    "startup_audit": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/startup-audit.log",
+    "keeper_log": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/logs/keeper.log",
+    "run_id": "drill-20260927T130041-32197",
+    "rewrite": {
+     "base_rewritten": 1,
+     "out_rewritten": 1,
+     "prod_literal_left": 0,
+     "sha256": "28be0ec3d651fab942bd8679cca62e3c6df67c99d6eee1b3523bd4109a7f4b1f"
+    }
+   },
+   "injections": [
+    {
+     "ts": 1790485246.635546,
+     "reason": "S1 kill#1（kill -9 循环）",
+     "pid": 32986,
+     "verify": {
+      "ok": true,
+      "pid": 32986,
+      "cmdline": "bash /home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/bin/run-scrape.sh A B C D E F",
+      "cwd": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/work",
+      "starttime": "884984",
+      "why": "ok"
+     },
+     "killed": true,
+     "pgid": 32986,
+     "signal": "any",
+     "inject_ts": 1790485246.635546,
+     "restart_s": 1.75,
+     "recover_s": 5.76,
+     "new_pid": 33884,
+     "work_resumed": false,
+     "completed_after_inject": false,
+     "timeout": false,
+     "save_after_inject": true,
+     "valid_lines_after": null,
+     "round": 1
+    },
+    {
+     "ts": 1790485252.3971846,
+     "reason": "S1 kill#2（kill -9 循环）",
+     "pid": 33884,
+     "verify": {
+      "ok": true,
+      "pid": 33884,
+      "cmdline": "bash /home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/bin/run-scrape.sh A B C D E F",
+      "cwd": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/work",
+      "starttime": "885574",
+      "why": "ok"
+     },
+     "killed": true,
+     "pgid": 33884,
+     "signal": "any",
+     "inject_ts": 1790485252.3971846,
+     "restart_s": 7.26,
+     "recover_s": null,
+     "new_pid": 35122,
+     "work_resumed": false,
+     "completed_after_inject": true,
+     "timeout": true,
+     "no_recovery": "converged_marker_present",
+     "round": 2
+    },
+    {
+     "round": 3,
+     "skipped": "no_live_job",
+     "complete_marker": true,
+     "note": "完成标记已在：keeper 守卫语义下不会再有重启 ⇒ 后续 kill 无观测对象"
+    }
+   ],
+   "notes": [],
+   "errors": [],
+   "mock": {
+    "port": 44649,
+    "pid": 32199,
+    "host": "127.0.0.1",
+    "profile": "ideal"
+   },
+   "snapshots": {
+    "pre": {
+     "phase": "pre-keeper",
+     "ts": 1790485241.8789368,
+     "ts_iso": "2026-09-27T13:00:41.878",
+     "job_pid": null,
+     "records": {
+      "lines": 0,
+      "unique": 0,
+      "invalid_lines": 0,
+      "dup_mms": 0
+     },
+     "progress": null,
+     "work_lines": 0,
+     "mock": {
+      "requests": 0,
+      "probe": 0,
+      "leaf_page": 0,
+      "dup_leaf_sort_pairs": 0,
+      "status": {},
+      "reason": {}
+     },
+     "complete": false
+    },
+    "keeper_up": {
+     "phase": "keeper-up",
+     "ts": 1790485241.8795023,
+     "ts_iso": "2026-09-27T13:00:41.879",
+     "job_pid": null,
+     "records": {
+      "lines": 0,
+      "unique": 0,
+      "invalid_lines": 0,
+      "dup_mms": 0
+     },
+     "progress": null,
+     "work_lines": 0,
+     "mock": {
+      "requests": 0,
+      "probe": 0,
+      "leaf_page": 0,
+      "dup_leaf_sort_pairs": 0,
+      "status": {},
+      "reason": {}
+     },
+     "complete": false
+    },
+    "final": {
+     "phase": "final",
+     "ts": 1790485259.912097,
+     "ts_iso": "2026-09-27T13:00:59.912",
+     "job_pid": 35122,
+     "records": {
+      "lines": 1160,
+      "unique": 1160,
+      "invalid_lines": 0,
+      "dup_mms": 0
+     },
+     "progress": {
+      "saves": 8,
+      "todo": 0,
+      "done": 0,
+      "gaps": 0,
+      "recovery_notes": 0,
+      "torn_requeue": 0
+     },
+     "work_lines": 0,
+     "mock": {
+      "requests": 41,
+      "probe": 31,
+      "leaf_page": 10,
+      "dup_leaf_sort_pairs": 0,
+      "status": {
+       "200": 41
+      },
+      "reason": {
+       "ok": 41
+      }
+     },
+     "complete": true
+    }
+   },
+   "observations": {
+    "injections": [
+     {
+      "ts": 1790485246.635546,
+      "reason": "S1 kill#1（kill -9 循环）",
+      "pid": 32986,
+      "verify": {
+       "ok": true,
+       "pid": 32986,
+       "cmdline": "bash /home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/bin/run-scrape.sh A B C D E F",
+       "cwd": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/work",
+       "starttime": "884984",
+       "why": "ok"
+      },
+      "killed": true,
+      "pgid": 32986,
+      "signal": "any",
+      "inject_ts": 1790485246.635546,
+      "restart_s": 1.75,
+      "recover_s": 5.76,
+      "new_pid": 33884,
+      "work_resumed": false,
+      "completed_after_inject": false,
+      "timeout": false,
+      "save_after_inject": true,
+      "valid_lines_after": null,
+      "round": 1
+     },
+     {
+      "ts": 1790485252.3971846,
+      "reason": "S1 kill#2（kill -9 循环）",
+      "pid": 33884,
+      "verify": {
+       "ok": true,
+       "pid": 33884,
+       "cmdline": "bash /home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/bin/run-scrape.sh A B C D E F",
+       "cwd": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/work",
+       "starttime": "885574",
+       "why": "ok"
+      },
+      "killed": true,
+      "pgid": 33884,
+      "signal": "any",
+      "inject_ts": 1790485252.3971846,
+      "restart_s": 7.26,
+      "recover_s": null,
+      "new_pid": 35122,
+      "work_resumed": false,
+      "completed_after_inject": true,
+      "timeout": true,
+      "no_recovery": "converged_marker_present",
+      "round": 2
+     },
+     {
+      "round": 3,
+      "skipped": "no_live_job",
+      "complete_marker": true,
+      "note": "完成标记已在：keeper 守卫语义下不会再有重启 ⇒ 后续 kill 无观测对象"
+     }
+    ],
+    "expect_audit": {
+     "keeper_restart": 3
+    }
+   },
+   "expect_audit": {
+    "keeper_restart": 3
+   },
+   "window_source": "cli",
+   "complete_wait": {
+    "ok": true,
+    "waited_s": 0.0,
+    "label": "complete"
+   },
+   "ended": "2026-09-27T13:01:06.954",
+   "wall_s": 25.18,
+   "final_snapshot": {
+    "phase": "final-after-teardown",
+    "ts": 1790485266.958548,
+    "ts_iso": "2026-09-27T13:01:06.958",
+    "job_pid": 35122,
+    "records": {
+     "lines": 1160,
+     "unique": 1160,
+     "invalid_lines": 0,
+     "dup_mms": 0
+    },
+    "progress": {
+     "saves": 8,
+     "todo": 0,
+     "done": 0,
+     "gaps": 0,
+     "recovery_notes": 0,
+     "torn_requeue": 0
+    },
+    "work_lines": 0,
+    "mock": {
+     "requests": 41,
+     "probe": 31,
+     "leaf_page": 10,
+     "dup_leaf_sort_pairs": 0,
+     "status": {
+      "200": 41
+     },
+     "reason": {
+      "ok": 41
+     }
+    },
+    "complete": true
+   },
+   "log_evidence": {
+    "branch": {
+     "count": 0,
+     "samples": []
+    },
+    "leaf": {
+     "count": 0,
+     "samples": []
+    },
+    "pre_fetch": {
+     "count": 0,
+     "samples": []
+    },
+    "probe_retry": {
+     "count": 0,
+     "samples": []
+    },
+    "probe_skip": {
+     "count": 0,
+     "samples": []
+    },
+    "big_gap": {
+     "count": 0,
+     "samples": []
+    },
+    "final_repair_round": {
+     "count": 0,
+     "samples": []
+    },
+    "throttle_snapshot": {
+     "count": 3,
+     "samples": [
+      [
+       "adaptive",
+       "0.2000"
+      ],
+      [
+       "adaptive",
+       "0.2000"
+      ],
+      [
+       "adaptive",
+       "0.2000"
+      ]
+     ]
+    },
+    "throttle_adjust": {
+     "count": 0,
+     "samples": []
+    },
+    "http_retry": {
+     "count": 0,
+     "samples": []
+    },
+    "exc": {
+     "count": 0,
+     "samples": []
+    },
+    "progress_fallback": {
+     "count": 0,
+     "samples": []
+    },
+    "records_repair": {
+     "count": 0,
+     "samples": []
+    },
+    "records_rebuild": {
+     "count": 0,
+     "samples": []
+    },
+    "reconcile": {
+     "count": 3,
+     "samples": [
+      "0",
+      "587",
+      "1160"
+     ]
+    },
+    "tolerance": {
+     "count": 4,
+     "samples": [
+      "容差",
+      "容差",
+      "容差",
+      "tolerance"
+     ]
+    },
+    "complete": {
+     "count": 1,
+     "samples": [
+      "全部完成"
+     ]
+    },
+    "converged": {
+     "count": 0,
+     "samples": []
+    },
+    "conc_item_error": {
+     "count": 0,
+     "samples": []
+    }
+   },
+   "mock_stats_file": {
+    "ok": true,
+    "uptime_s": 25.107,
+    "requests": 41,
+    "by_status": {
+     "200": 41
+    },
+    "by_reason": {
+     "ok": 41
+    },
+    "ratelimit_rejected": 0,
+    "server_latency_all_ms": {
+     "n": 41,
+     "p50": 7.149750999815296,
+     "p95": 8.881034998921677,
+     "p99": 10.77029800035234,
+     "max": 10.77029800035234
+    },
+    "server_latency_ms": {
+     "n": 41,
+     "p50": 7.149750999815296,
+     "p95": 8.881034998921677,
+     "p99": 10.77029800035234,
+     "max": 10.77029800035234
+    },
+    "config": {
+     "host": "127.0.0.1",
+     "port": 44649,
+     "profile": "ideal",
+     "records": 21600,
+     "seed": 20260915,
+     "depth": 2,
+     "fan": 3,
+     "dist": "zipf",
+     "alpha": 1.2,
+     "corpus_file": null,
+     "seed_subset": null,
+     "scale": 1.0,
+     "len_tail": [
+      1.0
+     ],
+     "title_partial_ratio": 0.15,
+     "lat_p50": 0.002,
+     "lat_sigma": 0.0,
+     "lat_overhead": 0.005,
+     "err_429": 0.0,
+     "err_400": 0.0,
+     "err_5xx": 0.0,
+     "err_5xx_status": 503,
+     "err_every_n": 0,
+     "err_every_status": 429,
+     "err_first_n": 0,
+     "err_first_status": 429,
+     "limit_rps": 0.0,
+     "limit_burst": 0,
+     "limit_status": 429,
+     "ready_file": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/logs/mock-ready.json",
+     "stats_file": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/logs/mock-stats.json",
+     "verbose": false
+    },
+    "ctrl": {
+     "err429": 0.0,
+     "err400": 0.0,
+     "err5xx": 0.0,
+     "probe_status": 0,
+     "probe_limit": 1,
+     "refuse": false,
+     "note": "",
+     "applied": []
+    },
+    "corpus": {
+     "mode": "synth",
+     "records": 21600,
+     "seed": 20260915,
+     "title_partial_ratio": 0.15,
+     "seed_totals_min": 561,
+     "seed_totals_max": 665,
+     "distinct_tokens": 108,
+     "seed_totals": {
+      "0": 580,
+      "1": 603,
+      "2": 604,
+      "3": 561,
+      "4": 592,
+      "5": 573,
+      "6": 603,
+      "7": 598,
+      "8": 665,
+      "9": 594,
+      "A": 593,
+      "B": 599,
+      "C": 582,
+      "D": 577,
+      "E": 610,
+      "F": 595,
+      "G": 628,
+      "H": 624,
+      "I": 623,
+      "J": 608,
+      "K": 601,
+      "L": 577,
+      "M": 598,
+      "N": 635,
+      "O": 588,
+      "P": 654,
+      "Q": 573,
+      "R": 601,
+      "S": 602,
+      "T": 610,
+      "U": 570,
+      "V": 603,
+      "W": 577,
+      "X": 598,
+      "Y": 575,
+      "Z": 626
+     },
+     "depth": 2,
+     "fan": 3,
+     "dist": "zipf",
+     "alpha": 1.2,
+     "len_tail": [
+      1.0
+     ],
+     "deep_pool": "3AH"
+    }
+   },
+   "audit_files": [
+    "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/audit.jsonl",
+    "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/audit.jsonl",
+    "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/memguard.jsonl"
+   ],
+   "_rig_dir": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1",
+   "integrity": {
+    "reference_unique": 0,
+    "unique": 1160,
+    "unique_loss": 0,
+    "lost_examples": [],
+    "extra_mms": 1160,
+    "dup_mms": 0,
+    "lines": 1160,
+    "invalid_lines": 0,
+    "dup_leaf_sort_pairs": 0,
+    "dup_leaf_examples": [],
+    "requests_total": 41,
+    "requests_vs_reference": null,
+    "probe_requests": 31,
+    "leaf_page_requests": 10,
+    "http_status": {
+     "200": 41
+    },
+    "reasons": {
+     "ok": 41
+    }
+   },
+   "audit_verify": {
+    "verifier": "audit-verify-v2",
+    "contract": "r3-audit-contract-v2",
+    "verifier_version": "2.1",
+    "contract_rev": "v2.1",
+    "mode": "strict-v2",
+    "scenario": "S1",
+    "scenario_dir": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1",
+    "files": [
+     "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/audit.jsonl",
+     "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/audit.jsonl",
+     "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/memguard.jsonl"
+    ],
+    "sinks": [
+     {
+      "path": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/audit.jsonl",
+      "role": "r3_audit",
+      "authoritative": true
+     },
+     {
+      "path": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/audit.jsonl",
+      "role": "keeper_audit",
+      "authoritative": true
+     },
+     {
+      "path": "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/memguard.jsonl",
+      "role": "memguard",
+      "authoritative": false
+     }
+    ],
+    "schema": {
+     "files": [
+      "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/audit.jsonl",
+      "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/audit.jsonl",
+      "/home/user/go/omni-crawler/omni/adapters/library/runs/drill-20260927T130041-32197/S1/out/memguard.jsonl"
+     ],
+     "lines": 34,
+     "parsed": 34,
+     "bad_lines": 0,
+     "bad_examples": [],
+     "adapters": {
+      "v2": 23,
+      "memguard": 11
+     },
+     "by_level": {
+      "process": 33,
+      "block": 1
+     },
+     "by_event": {
+      "run_start": 3,
+      "convergence_decision": 1,
+      "run_end": 1,
+      "singleton_acquired": 1,
+      "keeper_start": 1,
+      "keeper_exit_observed": 4,
+      "process_dead": 3,
+      "keeper_restart": 2,
+      "heartbeat_class": 1,
+      "restart_backoff": 1,
+      "restart_failed": 1,
+      "graceful_stop": 1,
+      "keeper_stop": 1,
+      "singleton_released": 1,
+      "keeper_exit": 1,
+      "mem_level_change": 6,
+      "gate_open": 4,
+      "mem_abort": 1
+     },
+     "by_layout": {
+      "v2": 23,
+      "aux": 11
+     },
+     "hard_deviations": 0,
+     "soft_deviations": 11,
+     "deviation_count": 11,
+     "deviations": [
+      {
+       "kind": "aux_level_type_conflict",
+       "count": 11,
+       "hard": false,
+       "examples": [
+        "memguard.jsonl:1 memguard level=0（整数档位）",
+        "memguard.jsonl:2 memguard level=0（整数档位）",
+        "memguard.jsonl:3 memguard level=0（整数档位）",
+        "memguard.jsonl:4 memguard level=0（整数档位）"
+       ]
+      }
+     ],
+     "canonical_records": 23,
+     "r3_sink_present": true,
+     "v2_records": 23,
+     "legacy_records": 0,
+     "authoritative_records": 23,
+     "seq_groups": [
+      {
+       "file": "audit.jsonl",
+       "pid": 32200,
+       "writer": "keeper",
+       "count": 18,
+       "seq_first": 1,
+       "seq_last": 18,
+       "ok": true,
+       "continuous": true,
+       "writer_key": true
+      },
+      {
+       "file": "audit.jsonl",
+       "pid": 32995,
+       "writer": "converge",
+       "count": 1,
+       "seq_first": 1,
+       "seq_last": 1,
+       "ok": true,
+       "continuous": true,
+       "writer_key": true
+      },
+      {
+       "file": "audit.jsonl",
+       "pid": 33893,
+       "writer": "converge",
+       "count": 1,
+       "seq_first": 1,
+       "seq_last": 1,
+       "ok": true,
+       "continuous": true,
+       "writer_key": true
+      },
+      {
+       "file": "audit.jsonl",
+       "pid": 35131,
+       "writer": "converge",
+       "count": 3,
+       "seq_first": 1,
+       "seq_last": 3,
+       "ok": true,
+       "continuous": true,
+       "writer_key": true
+      }
+     ],
+     "writer_counts": {
+      "converge": 5,
+      "keeper": 18
+     },
+     "writer_groups": 4,
+     "writerless_groups": 0,
+     "strict_pass": true,
+     "canonical_pass": true,
+     "r3_fields_pass": true
+    },
+    "checks": [
+     {
+      "id": "S1.keeper_restart_per_kill",
+      "why": "每一次 kill -9 都必须留下进程级重启事件（C3/A2）",
+      "level": "process",
+      "events": [
+       "keeper_restart"
+      ],
+      "min_count": 2,
+      "min_count_source": "injections.killed",
+      "audit_count": 2,
+      "audit_count_all": 2,
+      "audit_ok": true,
+      "window_ok": true,
+      "window_enforced": true,
+      "window_note": "窗口 [2026-09-27T13:00:36.635, 2026-09-27T13:03:52.397]（first_inj=2026-09-27T13:00:46.635 deadline=180s）",
+      "derived_ok": true,
+      "derived_hits": [
+       {
+        "channel": "log",
+        "key": "reconcile",
+        "count": 3,
+        "source": "out/scrape.log"
+       }
+      ],
+      "derived_rejects": [],
+      "channel": "audit",
+      "evidence_level": "high",
+      "ok": true,
+      "examples": [
+       {
+        "origin": "audit.jsonl:5",
+        "ts": 1790485242.896,
+        "event": "keeper_restart",
+        "layouts": "v2"
+       },
+       {
+        "origin": "audit.jsonl:9",
+        "ts": 1790485248.805,
+        "event": "keeper_restart",
+        "layouts": "v2"
+       }
+      ]
+     }
+    ],
+    "pass_count": 1,
+    "check_count": 1,
+    "missing_events": [],
+    "fail_reasons": [],
+    "derived_only": false,
+    "audit_only": true,
+    "channel": "audit",
+    "evidence_level": "high",
+    "window": {
+     "enforced": true,
+     "lo": 1790485236.635546,
+     "hi": 1790485432.3971846,
+     "note": "窗口 [2026-09-27T13:00:36.635, 2026-09-27T13:03:52.397]（first_inj=2026-09-27T13:00:46.635 deadline=180s）"
+    },
+    "lineage": {
+     "evidence_present": true,
+     "evidence_error": null,
+     "sources": [
+      {
+       "path": "out/records.jsonl",
+       "role": "records",
+       "size": 494197,
+       "mtime": 1790485252.314
+      },
+      {
+       "path": "out/scrape.log",
+       "role": "scrape_log",
+       "size": 4271,
+       "mtime": 1790485259.714
+      },
+      {
+       "path": "out/run.log",
+       "role": "run_log",
+       "size": 5042,
+       "mtime": 1790485259.714
+      },
+      {
+       "path": "out/progress.json",
+       "role": "progress",
+       "size": 363,
+       "mtime": 1790485259.666
+      },
+      {
+       "path": "out/progress.json.bak",
+       "role": "progress_bak",
+       "size": 363,
+       "mtime": 1790485248.898
+      },
+      {
+       "path": "out/heartbeat.json",
+       "role": "heartbeat",
+       "size": 2883,
+       "mtime": 1790485259.712
+      },
+      {
+       "path": "out/memguard.jsonl",
+       "role": "memguard",
+       "size": 5946,
+       "mtime": 1790485259.714
+      },
+      {
+       "path": "logs/keeper.log",
+       "role": "logs",
+       "size": 8425,
+       "mtime": 1790485266.782
+      },
+      {
+       "path": "logs/keeper.out",
+       "role": "logs",
+       "size": 12903,
+       "mtime": 1790485266.782
+      },
+      {
+       "path": "logs/mock-requests.jsonl",
+       "role": "logs",
+       "size": 5410,
+       "mtime": 1790485252.302
+      },
+      {
+       "path": "logs/mock.out",
+       "role": "logs",
+       "size": 112,
+       "mtime": 1790485266.938
+      },
+      {
+       "path": "state/gen/v8.rec",
+       "role": "state",
+       "size": 128,
+       "mtime": 1790485248.678
+      },
+      {
+       "path": "state/jobexit/v8.json",
+       "role": "state",
+       "size": 189,
+       "mtime": 1790485259.418
+      },
+      {
+       "path": "state/keeper-v3.checkpoint.json",
+       "role": "state",
+       "size": 463,
+       "mtime": 1790485266.522
+      },
+      {
+       "path": "state/keeper-v3.family",
+       "role": "state",
+       "size": 19,
+       "mtime": 1790485241.966
+      },
+      {
+       "path": "state/keeper-v3.lock",
+       "role": "state",
+       "size": 132,
+       "mtime": 1790485241.91
+      },
+      {
+       "path": "state/keeper-v3.pid",
+       "role": "state",
+       "size": 176,
+       "mtime": 1790485241.974
+      },
+      {
+       "path": "state/keeper-v3.state",
+       "role": "state",
+       "size": 231,
+       "mtime": 1790485266.734
+      },
+      {
+       "path": "state/pid/v8.pid",
+       "role": "state",
+       "size": 114,
+       "mtime": 1790485259.572
+      },
+      {
+       "path": "drill-env/fsize_kb",
+       "role": "drill_env",
+       "size": 2,
+       "mtime": 1790485241.777
+      },
+      {
+       "path": "bin/run-scrape.sh",
+       "role": "bin",
+       "size": 620,
+       "mtime": 1790485241.777
+      },
+      {
+       "path": "src/heartbeat.py",
+       "role": "src",
+       "size": 83191,
+       "mtime": 1789476098.706
+      },
+      {
+       "path": "src/memguard.py",
+       "role": "src",
+       "size": 52896,
+       "mtime": 1789476098.705
+      },
+      {
+       "path": "src/scrape_under_test.py",
+       "role": "src",
+       "size": 229929,
+       "mtime": 1790485241.776
+      }
+     ],
+     "readings": true,
+     "pid_refs": {},
+     "run_window": [
+      1790485241.772,
+      1790485266.954
+     ],
+     "assoc": [
+      {
+       "pid": 32200,
+       "strength": "strong",
+       "via": 32200,
+       "records": 18,
+       "file": "audit.jsonl"
+      },
+      {
+       "pid": 32995,
+       "strength": "strong",
+       "via": 32995,
+       "records": 1,
+       "file": "audit.jsonl"
+      },
+      {
+       "pid": 33893,
+       "strength": "strong",
+       "via": 33893,
+       "records": 1,
+       "file": "audit.jsonl"
+      },
+      {
+       "pid": 35131,
+       "strength": "strong",
+       "via": 35131,
+       "records": 3,
+       "file": "audit.jsonl"
+      }
+     ],
+     "post_hoc": []
+    },
+    "hard_violations": [],
+    "warnings": [
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:1"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:2"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:3"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:4"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:5"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:6"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:7"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:8"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:9"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:10"
+     },
+     {
+      "kind": "aux_level_type_conflict",
+      "detail": "memguard level=0（整数档位）",
+      "origin": "memguard.jsonl:11"
+     }
+    ],
+    "degraded_reasons": [],
+    "pass": true,
+    "canonical_pass": true,
+    "exit_code": 0,
+    "ts": 1790485267.024,
+    "stdout_tail": "el=0（整数档位）\nseq 分组（同文件内按 (pid, writer)，要求 1..N 连续）：audit.jsonl pid=32200 writer=keeper 18 条 OK; audit.jsonl pid=32995 writer=converge 1 条 OK; audit.jsonl pid=33893 writer=converge 1 条 OK; audit.jsonl pid=35131 writer=converge 3 条 OK\n血缘：evidence=True；真实证据 24 件；读数=True；run 窗口=[1790485241.772, 1790485266.954]；pid 关联=[(32200, 'strong'), (32995, 'strong'), (33893, 'strong'), (35131, 'strong')]\n时间窗：enforced=True 窗口 [2026-09-27T13:00:36.635, 2026-09-27T13:03:52.397]（first_inj=2026-09-27T13:00:46.635 deadline=180s）\n链路断言：1/1 通过（channel=audit，evidence_level=high）\n    [PASS] S1.keeper_restart_per_kill level=process 事件=keeper_restart 需≥2；audit=2；channel=audit；evidence_level=high；derived=[{'channel': 'log', 'key': 'reconcile', 'count': 3, 'source': 'out/scrape.log'}]\n判定：PASS（exit 0；canonical_pass=True）\n"
+   },
+   "scenario_readings": {
+    "probe_retry_lines": 0,
+    "zero_child_lines": 0,
+    "branch_lines": 0,
+    "throttle_adjust_lines": 0,
+    "http_retry_lines": 0,
+    "exc_lines": 0,
+    "progress_fallback_lines": 0,
+    "records_repair_lines": 0,
+    "records_rebuild_lines": 0,
+    "final_repair_rounds": 0,
+    "conc_item_errors": 0,
+    "torn_requeue_entries": 0
+   },
+   "assertions": [
+    {
+     "name": "recovery_within_deadline",
+     "ok": false,
+     "value": [
+      5.76,
+      null
+     ],
+     "limit": 180,
+     "detail": "每一次**实际做过的** kill -9 后「重新干活」耗时（s）；做过 2 次、成功恢复 1 次",
+     "soft": false
+    },
+    {
+     "name": "kill_loop_3rounds",
+     "ok": false,
+     "value": 2,
+     "limit": 3,
+     "detail": "要求的 3 轮 kill 是否都打到了活着的进程；不足 3 轮说明系统在中途已无作业可杀（往往是假收敛）—— 硬判据（不达下限即 FAIL）",
+     "soft": false
+    },
+    {
+     "name": "recovery_no_false_convergence_suspect",
+     "ok": false,
+     "value": 1,
+     "limit": 0,
+     "detail": "kill 后未观测到重新干活、却已出现完成标记的注入次数（假收敛嫌疑；软读数：硬面由 kill_loop_3rounds + no_unique_loss 承担）",
+     "soft": true
+    },
+    {
+     "name": "no_unique_loss",
+     "ok": true,
+     "value": 0,
+     "limit": 0,
+     "detail": "相对参照跑缺失的 unique mms 数（examples=[]）",
+     "soft": false
+    },
+    {
+     "name": "dup_leaves_within_tolerance",
+     "ok": true,
+     "value": 0,
+     "limit": 1,
+     "detail": "重复抓取的叶子块（mock 侧 (prefix,sort) 整页请求 >1 次的对数）",
+     "soft": false
+    },
+    {
+     "name": "records_wellformed",
+     "ok": true,
+     "value": 0,
+     "limit": 0,
+     "detail": "records.jsonl 末态损坏行数",
+     "soft": false
+    },
+    {
+     "name": "run_completed",
+     "ok": true,
+     "value": null,
+     "limit": null,
+     "detail": "scrape.log 出现完成标记（S6/S6b 单列为软读数：跑完≠收敛对，假收敛由 no_unique_loss 判）",
+     "soft": false
+    },
+    {
+     "name": "audit_link",
+     "ok": true,
+     "value": 1,
+     "limit": 1,
+     "detail": "audit-verify-v2：canonical 通道硬通过；channel=audit；window_enforced=True；",
+     "soft": false
+    },
+    {
+     "name": "audit_channel_audit_only",
+     "ok": true,
+     "value": "audit",
+     "limit": "audit",
+     "detail": "链路断言是否全部由结构化审计通道满足；derived-only 会被标注channel=derived / evidence_level=low 并降级",
+     "soft": true
+    },
+    {
+     "name": "audit_schema_strict",
+     "ok": true,
+     "value": 23,
+     "limit": 0,
+     "detail": "R3 契约 v2 严格布局校验（schema=r3-audit-v2 / ts_epoch / pid / seq 从 1 连续 / level / event / detail）",
+     "soft": true
+    }
+   ],
+   "verdict": "FAIL"
+  }
+ ],
+ "totals": {
+  "pass": 0,
+  "fail": 1,
+  "count": 1
+ }
+}

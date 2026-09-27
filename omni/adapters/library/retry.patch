@@ -1,0 +1,355 @@
+--- a/scrape.py
++++ b/scrape.py
+@@ -1545,6 +1545,236 @@
+ SESSION.trust_env = False
+ SESSION.mount('https://', LegacyTLSAdapter(pool_connections=10, pool_maxsize=10))
+ 
++# ===========================================================================
++# R3（C1）请求级自愈：错误分类 + 指数退避+抖动 + 重试预算 + 请求级审计
++#
++# 目标（goal-card §1 C1）：断连/超时/5xx 自动重试 ≥3 次、指数退避+抖动；每级自愈事件
++# 写结构化审计（refs/r3-audit-schema.md：retry_scheduled / retry_exhausted / error_classified）。
++#
++# ① 分类学（7 类；命名与语义对齐 refs/r3-audit-schema.md，异常名单对齐 R2 的 T8
++#    `_R2_NET_EXC_NAMES`）：dns / conn_reset / read_timeout / write_timeout /
++#    server_5xx / ratelimit / other。分类**只决定退避参数与停摆归属**；「是否重试」仍按
++#    基线集合 RETRY_STATUS_CODES 判定（= 基线 L1578 的 (400,401,403,429,500,502,503,504)
++#    逐值相同）⇒ 默认行为不劣化现状。
++# ② 退避：wait = min(cap, base × factor^att) × U(0.75, 1.25)，参数全部集中在 RETRY_BACKOFF。
++# ③ 停摆归属（消除 cooldown/sleep 双计，survey-throttle §B5 的明确要求）：
++#      · owner='cooldown'（ratelimit / auth / dns / conn_reset）：只 `LIMITER.cooldown(wait)`，
++#        真实等待由**下一次 LIMITER.acquire()** 承担 ⇒ 日志与审计里的 wait_s 与实际停摆
++#        一一对应，且全局限速器是唯一停摆所有者；
++#      · owner='sleep'（read_timeout / write_timeout / server_5xx / other）：只线程内
++#        `time.sleep(wait)`，全局节拍继续由 LIMITER.acquire() + throttle v2 的 note_status
++#        反馈负责，不额外全局停摆。
++#    基线的异常路径是 `cooldown(10)` **加** `sleep(5+5·att)`：两处计同一个窗口，实测多停
++#    5s（test-report T6 的 legacy 对照读数）；新路径每个错误**恰好一个**停摆归属。
++# ④ 与 throttle v2 的分工：throttle v2 拥有**长期节拍**（间隔 / AIMD 地板 / 1s 窗口上限，
++#    由 note_status 的 429/400/conn/5xx 反馈驱动）；fetch 重试只拥有**单次请求的重试排程与
++#    即时停摆**。THROTTLE_COOLDOWN=1.0 只是限速器内部小缓冲（未改动），不构成第二份退避。
++# ⑤ 预算：C1 要求「重试 ≥3 次」⇒ v2 下尝试次数下限 1+RETRY_MIN_RETRIES = 4；默认
++#    retries=6（= 5 次重试，与基线同值）。
++# ⑥ 开关：SCRAPE_RETRY=v2（默认）/ legacy（逐行为等价基线：cooldown+sleep 双计、无审计事件）。
++# ===========================================================================
++_R3_RUN_ID = os.environ.get('SCRAPE_RUN_ID') or ('boot-' + datetime.now().strftime('%Y%m%dT%H%M%S'))
++
++_RETRY_MODE_ALIASES = {'v2': 'v2', 'auto': 'v2', 'on': 'v2', '1': 'v2', 'true': 'v2', 'yes': 'v2',
++                       'legacy': 'legacy', 'v1': 'legacy', 'base': 'legacy', 'off': 'legacy',
++                       '0': 'legacy', 'false': 'legacy', 'no': 'legacy'}
++
++def _r3_retry_mode():
++    """SCRAPE_RETRY 解析：v2（默认，新自愈）/ legacy（基线逐行为等价，回滚开关）。
++    非法值 ⇒ 告警并回退 v2（fail-safe 方向：宁可多自愈，不可静默退回无退避）。"""
++    raw = (os.environ.get('SCRAPE_RETRY') or 'v2').strip().lower()
++    if raw in _RETRY_MODE_ALIASES:
++        return _RETRY_MODE_ALIASES[raw]
++    sys.stderr.write(f"[retry] 非法 SCRAPE_RETRY={raw!r} → 回退 v2\n")
++    return 'v2'
++
++RETRY_MODE = _r3_retry_mode()                 # 'v2' | 'legacy'
++RETRY_MIN_RETRIES = 3                         # C1 硬指标：断连/超时/5xx 至少重试 3 次
++RETRY_ENFORCE_MIN = _env_num('SCRAPE_RETRY_ENFORCE_MIN', 1, int) == 1   # v2 下强制满足 C1
++RETRY_MAX_ATTEMPTS = _env_num('SCRAPE_RETRY_MAX_ATTEMPTS', 12, int)     # 尝试次数硬上限（防御性）
++RETRY_JITTER_LO = 0.75                        # 抖动乘子下界（Crawl4AI async_dispatcher 同源取值）
++RETRY_JITTER_HI = 1.25                        # 抖动乘子上界
++# 每类错误的指数退避参数：class -> (base_s, factor, cap_s)；wait = min(cap, base×factor^att)×抖动
++RETRY_BACKOFF = {
++    'dns':           (2.0, 2.0, 30.0),        # 解析失败：按"网络整体不可用"处理（全局停摆）
++    'conn_reset':    (2.0, 2.0, 30.0),        # 重置/拒绝/中断/建立超时/SSL：同上
++    'read_timeout':  (1.0, 2.0, 15.0),        # 读超时：本次已耗掉请求超时，退避可短
++    'write_timeout': (1.0, 2.0, 15.0),        # 写超时：同上
++    'server_5xx':    (5.0, 2.0, 60.0),        # 服务端故障：保守（不等于基线 15+10·att 的侵略性）
++    'ratelimit':     (15.0, 1.5, 60.0),       # 429/400：基线首值 15s，改指数 + 抖动
++    'auth':          (15.0, 1.5, 60.0),       # 401/403：基线也重试，沿用保守档
++    'other':         (2.0, 2.0, 20.0),        # 其余异常（含 200 但 JSON 解析失败）：基线也重试
++}
++# 停摆归属：'cooldown' = 全局限速器唯一停摆（不 sleep）；'sleep' = 仅线程内退避（不 cooldown）
++RETRY_STALL_OWNER = {
++    'ratelimit': 'cooldown', 'auth': 'cooldown', 'dns': 'cooldown', 'conn_reset': 'cooldown',
++    'read_timeout': 'sleep', 'write_timeout': 'sleep', 'server_5xx': 'sleep', 'other': 'sleep',
++}
++RETRY_STATUS_CODES = (400, 401, 403, 429, 500, 502, 503, 504)   # = 基线 L1578 逐值相同
++RETRY_RATELIMIT_CODES = (400, 429)            # 与 throttle v2 的 'rlimit' 类同义（400 是本站限流码）
++RETRY_AUTH_CODES = (401, 403)
++RETRY_LEGACY_STATUS = (15, 10)              # legacy: wait = 15 + 10·att（基线 L1579；**int** ⇒ 日志逐字节相同）
++RETRY_LEGACY_EXC = (10, 5, 5)                 # legacy: cooldown(10) + sleep(5 + 5·att)（基线 L1601-1602；int 同上）
++RETRY_AUDIT_CLASSIFY_EVERY = max(1, _env_num('SCRAPE_RETRY_CLASSIFY_EVERY', 1, int))  # 采样比（≥2 时降频）
++
++# 异常 → 类别的文本特征（顺序敏感：dns → write → read → reset → other）
++_RETRY_DNS_TYPES = ('NameResolutionError', 'gaierror')
++_RETRY_DNS_MARKERS = ('name resolution', 'name or service not known', 'nodename nor servname',
++                      'getaddrinfo', 'temporary failure in name resolution',
++                      'no address associated', 'failed to resolve', 'name does not resolve')
++_RETRY_WRITE_MARKERS = ('write timed out', 'writetimeout', 'write timeout')
++_RETRY_READ_MARKERS = ('read timed out', 'readtimeout', 'read timeout', 'timed out', 'timeout')
++_RETRY_READ_TYPES = ('ReadTimeout', 'Timeout', 'TimeoutError', 'timeout')
++_RETRY_CONNECT_TIMEOUT_TYPES = ('ConnectTimeout',)     # 建立连接超时 ⇒ 归连接类
++_RETRY_RESET_TYPES = ('ConnectionError', 'ConnectionResetError', 'ConnectionAbortedError',
++                      'RemoteDisconnected', 'ProtocolError', 'SSLError', 'SSLEOFError',
++                      'ProxyError', 'NewConnectionError', 'MaxRetryError', 'IncompleteRead',
++                      'ChunkedEncodingError', 'BrokenPipeError', 'ConnectionRefusedError')
++_RETRY_RESET_MARKERS = ('connection reset', 'connection aborted', 'connection refused',
++                        'connection error', 'remote end closed', 'remote disconnected',
++                        'eof occurred', 'bad status line', 'tunnel connection failed',
++                        'broken pipe', 'ssl', 'certificate', 'proxy')
++
++
++def _retry_class_of_status(code):
++    """HTTP 状态码 → 类别（分类学；与「是否重试」解耦）。"""
++    try:
++        c = int(code)
++    except (TypeError, ValueError):
++        return 'other'
++    if c in RETRY_RATELIMIT_CODES:
++        return 'ratelimit'
++    if c in RETRY_AUTH_CODES:
++        return 'auth'
++    if 500 <= c <= 599:
++        return 'server_5xx'
++    if 400 <= c <= 499:
++        return 'other'
++    return 'other'
++
++
++def _retry_class_of_exc(e):
++    """异常 → 类别。判据 = 异常类名 + 消息文本特征（顺序敏感，见常量表）。"""
++    name = type(e).__name__
++    try:
++        msg = str(e)[:400].lower()
++    except Exception:
++        msg = ''
++    for t in _RETRY_DNS_TYPES:
++        if name == t:
++            return 'dns'
++    for m in _RETRY_DNS_MARKERS:
++        if m in msg:
++            return 'dns'
++    for t in _RETRY_CONNECT_TIMEOUT_TYPES:
++        if name == t:
++            return 'conn_reset'
++    for m in _RETRY_WRITE_MARKERS:
++        if m in msg:
++            return 'write_timeout'
++    for m in _RETRY_READ_MARKERS:
++        if m in msg:
++            return 'read_timeout'
++    for t in _RETRY_READ_TYPES:
++        if name == t:
++            return 'read_timeout'
++    for t in _RETRY_RESET_TYPES:
++        if name == t:
++            return 'conn_reset'
++    for m in _RETRY_RESET_MARKERS:
++        if m in msg:
++            return 'conn_reset'
++    return 'other'
++
++
++def _retry_wait_plan(cls, att):
++    """一次退避的 (wait_s, owner)：退避时长与停摆归属的**唯一**来源。"""
++    base, factor, cap = RETRY_BACKOFF.get(cls, RETRY_BACKOFF['other'])
++    raw = float(base) * (float(factor) ** int(att))
++    if cap:
++        raw = min(raw, float(cap))
++    wait = raw * random.uniform(RETRY_JITTER_LO, RETRY_JITTER_HI)
++    return wait, RETRY_STALL_OWNER.get(cls, 'sleep')
++
++
++def _retry_apply_wait(wait, owner):
++    """施加退避（**单一**停摆归属）。返回实际生效方式：'cooldown' | 'sleep'。
++
++    owner='cooldown' ⇒ 只登记全局冷却，真实等待发生在下一次 LIMITER.acquire()（避免与本
++    函数的 sleep 叠加成双计）；无法登记时退化为线程内 sleep（宁停不空转）。
++    """
++    if owner == 'cooldown':
++        try:
++            LIMITER.cooldown(wait)
++            return 'cooldown'
++        except Exception:
++            pass
++    time.sleep(wait)
++    return 'sleep'
++
++
++# ---- 请求级审计（R3 schema；独立模块 audit.py，函数内 import，缺模块即整体 no-op） ----
++_AUDIT_MOD = {'mod': None, 'tried': False, 'failed': 0, 'cls_n': 0}
++_AUDIT_LOCK = threading.Lock()
++
++def _audit_get():
++    """懒加载 audit.py 并绑定 OUT/audit.jsonl。任何异常 ⇒ 审计 no-op，绝不影响抓取。"""
++    if not _AUDIT_MOD['tried']:
++        with _AUDIT_LOCK:
++            if not _AUDIT_MOD['tried']:
++                _AUDIT_MOD['tried'] = True
++                try:
++                    import audit as _am
++                    _am.init(path=str(OUT / 'audit.jsonl'), run=_R3_RUN_ID)
++                    _AUDIT_MOD['mod'] = _am
++                    log(f"[audit] 请求级审计 path={_am.path()} run={_R3_RUN_ID} "
++                        f"enabled={_am.is_enabled()}")
++                except Exception as _ae:
++                    _AUDIT_MOD['mod'] = None
++                    log(f"[audit] 审计模块未启用（{type(_ae).__name__}: {_ae}）⇒ 审计 no-op")
++    return _AUDIT_MOD['mod']
++
++def _retry_audit(level, event, detail=None):
++    try:
++        mod = _audit_get()
++        if mod is None:
++            return None
++        return mod.emit(level, event, detail)
++    except Exception:
++        _AUDIT_MOD['failed'] += 1
++        return None
++
++def _retry_audit_classified(cls, action, status=None, exc=None):
++    """`error_classified {class, action}`（可选事件；SCRAPE_RETRY_CLASSIFY_EVERY≥2 时按 N 采样）。"""
++    try:
++        if RETRY_AUDIT_CLASSIFY_EVERY > 1:
++            _AUDIT_MOD['cls_n'] += 1
++            if (_AUDIT_MOD['cls_n'] % RETRY_AUDIT_CLASSIFY_EVERY) != 0:
++                return None
++        d = {'class': cls, 'action': action}
++        if status is not None:
++            d['status'] = int(status)
++        if exc:
++            d['exc'] = str(exc)[:80]
++        return _retry_audit('request', 'error_classified', d)
++    except Exception:
++        _AUDIT_MOD['failed'] += 1
++        return None
++
++def _retry_audit_scheduled(attempt, status_or_exc, wait_s, q, cls, owner):
++    """`retry_scheduled {attempt, status_or_exc, wait_s, q}`（+ class/stall_owner 便于诊断）。"""
++    return _retry_audit('request', 'retry_scheduled', {
++        'attempt': int(attempt), 'status_or_exc': str(status_or_exc)[:120],
++        'wait_s': round(float(wait_s), 3), 'q': str(q)[:120],
++        'class': cls, 'stall_owner': owner})
++
++def _retry_audit_exhausted(attempts, q, last_error):
++    """`retry_exhausted {attempts, q, last_error}`：预算耗尽 ⇒ 调用方需回队/降级（R4）。"""
++    return _retry_audit('request', 'retry_exhausted', {
++        'attempts': int(attempts), 'q': str(q)[:120],
++        'last_error': str(last_error)[:200]})
++
++
+ def fetch(q, limit=1, offset=0, sort=None, retries=6):
+     params = {"vid": VID, "tab": "default_tab", "scope": "MyInstitution", "q": q,
+               "limit": str(limit), "offset": str(offset), "lang": "zh_CN",
+@@ -1554,7 +1784,19 @@
+     url = HOST + "/primaws/rest/pub/pnxs"
+     # R2 v2: 本次请求的类别（延迟劣化基线按类别隔离，见 RateLimiter 文档）
+     _kind = 'bulk' if limit >= THROTTLE_BULK_LIMIT else 'light'
+-    for att in range(retries):
++    # R3: `retries` 语义与基线同名（= 尝试次数，非重试次数）。v2 下强制 C1 下限
++    #     （至少 1+RETRY_MIN_RETRIES 次尝试 ⇒ 断连/超时/5xx 至少重试 3 次）。
++    try:
++        _attempts = int(retries)
++    except (TypeError, ValueError):
++        _attempts = 6
++    _attempts = max(1, _attempts)
++    if RETRY_MODE == 'v2':
++        _attempts = min(_attempts, max(1, int(RETRY_MAX_ATTEMPTS)))
++        if RETRY_ENFORCE_MIN:
++            _attempts = max(_attempts, 1 + int(RETRY_MIN_RETRIES))
++    _last_err = None
++    for att in range(_attempts):
+         LIMITER.acquire()
+         t0 = time.time()
+         # R2 v2（T5 读数口径）：acquire() 返回后即「请求发出时刻」，一次尝试登记一笔。
+@@ -1575,32 +1817,81 @@
+                 except Exception:
+                     pass
+                 return r.json()
+-            if r.status_code in (400, 401, 403, 429, 500, 502, 503, 504):
+-                wait = 15 + att * 10
+-                log(f"    HTTP {r.status_code} q={q[:38]!r} cooldown {wait}s ({att+1})")
++            # ---- 非 200：分类 → （重试集合内）退避重试 /（集合外）致命返回 None ----
++            _cls = _retry_class_of_status(r.status_code)
++            _lat = time.time() - t0
++            if r.status_code not in RETRY_STATUS_CODES:
++                # 基线语义（L1588-1593）：不在重试集合内的状态码 = 致命，不重试、返回 None
++                log(f"    HTTP {r.status_code} fatal q={q[:60]!r}")
+                 try:
+-                    LIMITER.note_status(r.status_code, time.time() - t0, kind=_kind, issued_ts=t0)
++                    LIMITER.note_status(r.status_code, _lat, kind=_kind, issued_ts=t0)
+                 except Exception:
+                     pass
+-                LIMITER.cooldown(wait)
+-                time.sleep(wait)
++                _retry_audit_classified(_cls, 'fatal', status=r.status_code)
++                return None
++            if RETRY_MODE == 'legacy':
++                # ---- 基线逐行为等价（L1578-1587）：cooldown(wait) + sleep(wait) ----
++                _wait = RETRY_LEGACY_STATUS[0] + att * RETRY_LEGACY_STATUS[1]
++                log(f"    HTTP {r.status_code} q={q[:38]!r} cooldown {_wait}s ({att+1})")
++                try:
++                    LIMITER.note_status(r.status_code, _lat, kind=_kind, issued_ts=t0)
++                except Exception:
++                    pass
++                LIMITER.cooldown(_wait)
++                time.sleep(_wait)
++                _last_err = f"HTTP {r.status_code}"
+                 continue
+-            log(f"    HTTP {r.status_code} fatal q={q[:60]!r}")
+             try:
+-                LIMITER.note_status(r.status_code, time.time() - t0, kind=_kind, issued_ts=t0)
++                LIMITER.note_status(r.status_code, _lat, kind=_kind, issued_ts=t0)
+             except Exception:
+                 pass
+-            return None
++            _last_err = f"HTTP {r.status_code}"
++            _more = (att + 1) < _attempts
++            _retry_audit_classified(_cls, 'retry' if _more else 'exhausted',
++                                    status=r.status_code)
++            if not _more:
++                break                                   # 预算耗尽 → 出循环写 retry_exhausted
++            _wait, _owner = _retry_wait_plan(_cls, att)
++            log(f"    HTTP {r.status_code} [{_cls}] q={q[:38]!r} backoff {_wait:.2f}s "
++                f"owner={_owner} ({att+1}/{_attempts - 1})")
++            _retry_audit_scheduled(att + 1, f"HTTP {r.status_code}", _wait, q, _cls, _owner)
++            _retry_apply_wait(_wait, _owner)            # 先写审计再停摆（停摆期被 kill 也不丢事件）
++            continue
+         except Exception as e:
+-            log(f"    EXC {type(e).__name__}: {str(e)[:60]} q={q[:38]!r}")
++            if RETRY_MODE == 'legacy':
++                # ---- 基线逐行为等价（L1594-1602）：cooldown(10) + sleep(5+5·att) ----
++                log(f"    EXC {type(e).__name__}: {str(e)[:60]} q={q[:38]!r}")
++                try:
++                    LIMITER.note_status(None, time.time() - t0, exc=type(e).__name__,
++                                        kind=_kind, issued_ts=t0)
++                except Exception:
++                    pass
++                LIMITER.cooldown(RETRY_LEGACY_EXC[0])
++                time.sleep(RETRY_LEGACY_EXC[1] + att * RETRY_LEGACY_EXC[2])
++                _last_err = f"{type(e).__name__}: {str(e)[:120]}"
++                continue
++            _cls = _retry_class_of_exc(e)
++            _ename = type(e).__name__
++            _emsg = str(e)[:120]
++            log(f"    EXC[{_cls}] {_ename}: {str(e)[:60]} q={q[:38]!r}")
+             try:
+-                LIMITER.note_status(None, time.time() - t0, exc=type(e).__name__,
++                LIMITER.note_status(None, time.time() - t0, exc=_ename,
+                                     kind=_kind, issued_ts=t0)
+             except Exception:
+                 pass
+-            LIMITER.cooldown(10)
+-            time.sleep(5 + att * 5)
++            _last_err = f"{_ename}: {_emsg}"
++            _more = (att + 1) < _attempts
++            _retry_audit_classified(_cls, 'retry' if _more else 'exhausted', exc=_ename)
++            if not _more:
++                break
++            _wait, _owner = _retry_wait_plan(_cls, att)
++            log(f"    EXC[{_cls}] {_ename} q={q[:38]!r} backoff {_wait:.2f}s "
++                f"owner={_owner} ({att+1}/{_attempts - 1})")
++            _retry_audit_scheduled(att + 1, f"{_ename}: {_emsg}", _wait, q, _cls, _owner)
++            _retry_apply_wait(_wait, _owner)
++            continue
+     log(f"    请求最终失败 q={q[:50]!r}")
++    _retry_audit_exhausted(_attempts, q, _last_err)
+     return None
+ 
+ def get_total(prefix, sort=None):

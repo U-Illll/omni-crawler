@@ -1,0 +1,1417 @@
+--- R3/impl/slot-keeper3/keeper-v3.sh	2026-09-16 11:01:18.488805326 +0800
++++ R3p4/slot-keeper-match/keeper-v3.sh	2026-09-16 15:26:19.309817839 +0800
+@@ -40,6 +40,7 @@
+ #                              带 advisory 单例探测：冲突只审计不退出
+ #   keeper-v3.sh status        打印各作业状态（只读；含 TRUST / HB_CLASS 列）
+ #   keeper-v3.sh stop          请求优雅停止（写停止标志，不发送任何信号）
++#   keeper-v3.sh resume [JOB]  解除机器判据造成的终态/停机（默认 all；清预算 + 审计）
+ #   keeper-v3.sh fingerprint   打印环境指纹 JSON（只读，不落审计）
+ #   keeper-v3.sh hbclass       打印一次心跳分类结果（只读，不落审计）
+ #   keeper-v3.sh lock-probe    探测单例锁持有者（只读，不落审计）
+@@ -50,6 +51,56 @@
+ # =============================================================================
+ 
+ # =============================================================================
++# keeper-v3.1 —— R3p4/P4-D 修订（F6 完成判据机器化 + c1 冒充防护 + 锁族加固）。
++#   相对 v3.0 的增补（对应 crit-correct H5/K-3、crit-adversarial c1、K-1/K-2/K-5）：
++#
++#  [J] 完成/失败判据机器化（F6 闭环；audit-selfheal §4.3.2「只认结构化终态」）：
++#      · 世代记录：每次 spawn 由 keeper 亲写 gen/<job>.rec（pid + starttime + token 哈希
++#        + spawn 时刻 + keeper pid）。这是"这个进程是 keeper 拉起的"的唯一机器指纹。
++#      · 退出码：作业是 keeper 的直接子进程（LAUNCH_SHIM 结尾 exec；setsid 不 fork），
++#        进程从 /proc 消失后 `wait <pid>` 立即返回真实退出码（信号死 = 128+N），
++#        同时回收僵尸；读到的码写入持久化终态 terminal/<job>.json（跨 keeper 重启可复核）。
++#      · 结构化终态：读 convergence-report.json 的 decided/terminal/exit_code/pid/run
++#        （新鲜度门槛：mtime ≥ 本次 spawn 时刻，或报告内 pid == 被判定 pid；
++#         过期报告一律标 stale 并审计，绝不采信陈旧结论）。
++#      · 退出码处置矩阵（KEEPER_MACHINE_VERDICT=1 为主判据）：
++#          0  收敛完成       → 终态停机（terminal/<job>.json + keeper_job_stop 审计，不再重启）
++#          3  未收敛         → 有限重启 KEEPER_INCOMPLETE_RETRIES 次；超限 ⇒ keeper_job_halt
++#                             （停机告警：审计 + halt/<job>.json + 状态文件），防空转循环
++#                             —— H5「exit 3 被当崩溃 ⇒ 无界重启」在此闭环
++#          4  优雅自停/stall → 重启（resume 语义），受同一重启预算约束
++#          信号死/其他非零   → 崩溃路径（process_dead + keeper_restart）+ 重启预算
++#      · 重启预算（supervisord startretries 式）：连续快速失败（活不过 KEEPER_RAPID_DEATH
++#        秒）达 KEEPER_START_RETRIES ⇒ 停止重启 + keeper_job_halt 升级告警
++#        （v3.0 的 FLAP 只审计不停止 ⇒ 现已闭环）。
++#      · grep 完成标记退化为兼容降级通道：KEEPER_COMPAT_GREP 默认 0（关闭）；开启时
++#        仅作兜底判据，且必须以 evidence_level=low + 显式审计标注。
++#
++#  [K] 冒充防护（c1 / crit-adversarial C1）：token 单证不得静默认领——
++#      · 认领 = 世代记录（pid+starttime+token 哈希）∧ 身份证据（argv/cwd/exe）∧ 进程存活；
++#      · 世代记录存在时**只有** pid+starttime 与记录逐字相符的进程是本作业；偷 token 的
++#        陌生进程（token 哈希相符而 pid/starttime 不符）⇒ keeper_adopt_refused
++#        （reason=stranger_token / stranger_candidate / pidfile_generation_mismatch），
++#        不认领、不静默、不写 pidfile；真作业缺席则照常重启（c1b 后果修正）；
++#      · 无世代记录（keeper 首次上任 / state 被清）⇒ 仅允许"token+路径+cwd+exe 全命中"的
++#        legacy 认领，且必须写 adopt_unverified（reason=token_without_generation_record）；
++#      · 后果修正（c1b）：真作业死亡不再被冒充者静默——陌生候选被拒 ⇒ 真作业缺席 ⇒
++#        走重启路径（process_dead + keeper_restart），恢复时限仍受 A2 ≤180s 约束。
++#
++#  [L] 锁族加固（K-1/K-2/K-5）：
++#      · K-1 分裂脑：持锁后记录锁文件 dev:inode 并每轮校验；锁被删/重建 ⇒ 先尝试在新
++#        inode 上重新 flock：拿到 ⇒ keeper_lock_rotated{action=reacquired} 续持有；
++#        拿不到 ⇒ singleton_conflict{reason=lock_replaced_held_elsewhere} 并以退出码 6
++#        让位（绝不两个实例同时"持锁"）。flock 失败区分「冲突」(rc=4) 与「不可用」
++#        (rc=5 + errno 文本)；冲突取证不再只信落盘 holder 记录——用 /proc/<pid>/fdinfo
++#        交叉定位真实持有者（C2b：陈旧记录 15/24 错指认）。
++#      · K-2 fd 泄漏：心跳读取子进程、tick 内 sleep、spawn 核对轮询、TERM 宽限等**长命/可预测**
++#        外部子命令显式 9>&-（作业本体 v3.0 已如此）。残留面：bash 为命令替换 fork 的短命子壳
++#        仍会在毫秒级窗口持有继承来的 fd 9（实测单持有者 ≤~100ms，见 test-report §7.1；
++#        真"零继承"须把锁交独立 holder 进程，bash 无法对已开 fd 设 CLOEXEC）。
++#      · K-5 PID 复用：status / lock-probe / holder 校验把 keeper 自己写的 starttime
++#        一并核对，cmdline 亦须命中本 keeper。
++# =============================================================================
+ # keeper-v3.0 —— R3 自愈轮升级（C3 进程级自愈 + R3 审计 schema）。相对 v2 的增补：
+ #
+ #  [E] flock 单例锁（R1 移交 5）：start/daemon 独占 $KEEPER_STATE_DIR/keeper-v3.lock；
+@@ -100,7 +151,7 @@
+ 
+ set -uo pipefail
+ 
+-KEEPER_VERSION="keeper-v3.0"
++KEEPER_VERSION="keeper-v3.1"
+ KEEPER_SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+ KEEPER_DIR="$(dirname "$KEEPER_SELF")"
+ 
+@@ -142,6 +193,16 @@
+ : "${KEEPER_ADOPT_LEGACY:=1}"           # 1=允许无 token 的 legacy 认领（必审计）；0=拒绝
+ : "${KEEPER_ADOPT_LOOSE:=1}"            # 1=允许"绝对路径+exe+唯一候选"的宽松认领（必审计）
+ : "${KEEPER_TOKEN_ENFORCE:=1}"          # 1=spawn 时注入 SCRAPE_KEEPER_TOKEN
++# ------- v3.1 [J][K][L]：机器化终态判据 / 冒充防护 / 锁族 -------------------------
++: "${KEEPER_MACHINE_VERDICT:=1}"        # 1=以 exit code + 结构化终态为完成/失败主判据（F6）
++: "${KEEPER_COMPAT_GREP:=0}"            # 1=允许 grep 完成标记作为兼容降级判据（默认关）
++: "${KEEPER_EXIT_GRACE_MS:=1500}"       # 观测到进程消失后等待结构化报告落盘的宽限(ms)
++: "${KEEPER_INCOMPLETE_RETRIES:=2}"     # exit 3（未收敛）有限重启次数，超限 ⇒ 停机告警
++: "${KEEPER_START_RETRIES:=5}"          # 连续快速失败上限（startretries 式），超限 ⇒ 停止重启
++: "${KEEPER_HALT_ON_FLAP:=1}"           # 1=超限即停止重启 + flap 升级告警；0=仅告警（v3.0 语义）
++: "${KEEPER_CONV_REPORT:=}"             # 全局结构化终态报告路径；空=按作业推导，"-"=禁用
++: "${KEEPER_GEN_BIND:=1}"               # 1=认领须与世代记录（pid+starttime+token 哈希）绑定
++: "${KEEPER_LOCK_INODE_GUARD:=1}"       # 1=每轮校验锁文件 inode（防「删锁重建」分裂脑）
+ # ---- rail 快照：必须在 source conf 之前读取（部署模板改不了这三条挡板）----------
+ KEEPER_RAIL_ALLOW_CWD_STRICT_OFF="${KEEPER_ALLOW_CWD_STRICT_OFF:-0}"
+ KEEPER_RAIL_ALLOW_SINGLETON_OFF="${KEEPER_ALLOW_SINGLETON_OFF:-0}"
+@@ -153,6 +214,7 @@
+ JOB_NAME=(); JOB_SCRIPT=(); JOB_CWD=(); JOB_COMPLOG=(); JOB_COMPPAT=()
+ JOB_OUTLOG=(); JOB_EXTRA=(); JOB_BASENAME=(); JOB_RELPATH=(); JOB_PIDFILE=()
+ JOB_EXE_RE=(); JOB_HB_FILE=()                 # v3：每作业心跳文件（消费 runtime 块用）
++JOB_CONV_REPORT=()             # v3.1：每作业结构化终态报告路径覆盖（"-"=禁用该通道）
+ declare -A JOB_EXEC_OVERRIDE=()
+ declare -A JOB_CWD_STRICT=()   # 每作业 cwd 强核对开关，默认 1（v3：由 rail 守护）
+ JOB_HB_SRC=()                  # 心跳来源标注：conf/job_heartbeat | global | none
+@@ -171,6 +233,7 @@
+   JOB_PIDFILE+=("$KEEPER_STATE_DIR/pid/$name.pid")
+   JOB_HB_FILE+=("${KEEPER_HEARTBEAT_FILE:-}")
+   JOB_HB_SRC+=("$([ -n "${KEEPER_HEARTBEAT_FILE:-}" ] && printf global || printf none)")
++  JOB_CONV_REPORT+=("")
+   case "$script" in
+     *.py) JOB_EXE_RE+=('^(python[0-9.]*|.*/python[0-9.]*)$') ;;
+     *.sh) JOB_EXE_RE+=('^(ba)?sh$|.*/(ba)?sh$') ;;
+@@ -211,6 +274,15 @@
+   done
+   return 1
+ }
++# job_convreport NAME PATH —— v3.1：该作业的结构化终态报告路径（convergence-report.json）
++#   PATH="-" ⇒ 禁用报告通道（只认 exit code / 兼容 grep）；未声明 ⇒ 由完成标记日志目录推导
++job_convreport() {
++  local n="$1" f="$2" i=0
++  for ((i=0; i<${#JOB_NAME[@]}; i++)); do
++    if [ "${JOB_NAME[$i]}" = "$n" ]; then JOB_CONV_REPORT[$i]="$f"; return 0; fi
++  done
++  return 1
++}
+ cwd_strict_of() { printf '%s' "${JOB_CWD_STRICT[$1]:-1}"; }
+ job_count() { printf '%s' "${#JOB_NAME[@]}"; }
+ job_exec_of() {
+@@ -313,7 +385,10 @@
+ #   · 5 个 R3 process 级事件：keeper_restart（restart 的别名）/ keeper_adopt_refused /
+ #     singleton_conflict / heartbeat_stall / graceful_stop —— 只有这 5 个 r3_event 非 null。
+ AUDIT_SEQ=0
+-R3_ALIAS_EVENTS="keeper_restart:restart keeper_adopt_refused:keeper_adopt_refused singleton_conflict:singleton_conflict heartbeat_stall:heartbeat_stall graceful_stop:graceful_stop"
++# canonical 事件名（R3p4/refs/audit-contract-v2.md §2）：左=写入名，右=r3_event 别名。
++# v3.1 新增的进程级事件一律**直接用 canonical 名写入**（identity 映射），便于校验器与
++# 合并槽按统一口径识别；旧事件（restart 等）保持写入名不变 + 别名映射（子集兼容）。
++R3_ALIAS_EVENTS="keeper_restart:restart keeper_adopt_refused:keeper_adopt_refused singleton_conflict:singleton_conflict heartbeat_stall:heartbeat_stall graceful_stop:graceful_stop keeper_exit:keeper_exit keeper_lock_unavailable:keeper_lock_unavailable keeper_lock_rotated:keeper_lock_rotated keeper_job_stop:keeper_job_stop keeper_job_halt:keeper_job_halt keeper_terminal_report_stale:keeper_terminal_report_stale keeper_exit_observed:keeper_exit_observed keeper_restart_budget_exhausted:keeper_restart_budget_exhausted keeper_job_resume:keeper_job_resume"
+ r3_event_of() { # EVENT → R3 规范事件名（非 R3 事件返回空）
+   local e="$1" pair
+   for pair in $R3_ALIAS_EVENTS; do
+@@ -337,8 +412,10 @@
+   local r3 line f
+   r3="$(r3_event_of "$evn")"
+   AUDIT_SEQ=$((AUDIT_SEQ + 1))
+-  line="$(printf '{"ts":"%s","ts_epoch":%s,"schema":"keeper-audit/1","r3_schema":"r3-audit/1","keeper":"%s","run_id":"%s","run":"%s","env":"%s","host":"%s","keeper_pid":%s,"ns_mnt":"%s","job":"%s","level":"%s","event":"%s","seq":%s,"from_pid":%s,"to_pid":%s,"evidence":%s,"detail":%s,"r3_event":%s}' \
+-    "$(now_iso)" "$(epoch_s)" "$KEEPER_VERSION" "$RUN_ID" "$RUN_ID" "$KEEPER_ENV_TAG" "$HOST_S" "$$" \
++  # v3.1：**增补**（不改既有键）ts_iso（= ts 的契约 v2 名）与 pid（= keeper_pid 的契约 v2 名），
++  # 使同一行同时满足 v2 子集解析器与 r3-audit-v2 读侧（行布局权威仍归 audit-unify 槽）。
++  line="$(printf '{"ts":"%s","ts_iso":"%s","ts_epoch":%s,"schema":"keeper-audit/1","r3_schema":"r3-audit/1","keeper":"%s","run_id":"%s","run":"%s","env":"%s","host":"%s","keeper_pid":%s,"pid":%s,"ns_mnt":"%s","job":"%s","level":"%s","event":"%s","seq":%s,"from_pid":%s,"to_pid":%s,"evidence":%s,"detail":%s,"r3_event":%s}' \
++    "$(now_iso)" "$(now_iso)" "$(epoch_s)" "$KEEPER_VERSION" "$RUN_ID" "$RUN_ID" "$KEEPER_ENV_TAG" "$HOST_S" "$$" "$$" \
+     "$(jesc "$NS_MNT")" "$(jesc "$CUR_JOB")" "$lvl" "$(jesc "$evn")" "$AUDIT_SEQ" "$fp" "$tp" "$ex" "$det" \
+     "$([ -n "$r3" ] && printf '"%s"' "$r3" || printf 'null')")"
+   for f in $KEEPER_AUDIT; do
+@@ -592,6 +669,8 @@
+ DET_WHY=""
+ DET_EV='{}'
+ DET_TRUST=""            # token | path_verified | relative_cwd_ok | legacy_loose | ""
++DET_REFUSED_JSON='[]'   # v3.1：本轮被拒认领的候选（c1 冒充防护证据）
++DET_REFUSED_N=0
+ PF_REJECT=""            # PID 文件被否掉的原因（保留进认领证据，便于追责）
+ PF_REJECT_PID=""
+ # refuse_adopt CAND_PID REASON SOURCE EXTRA_EV —— 拒绝认领一个候选（R3 事件）
+@@ -611,36 +690,50 @@
+ detect_job() {
+   local i="$1" n cand
+   DET_STATE="absent"; DET_PID=""; DET_WHY=""; DET_EV='{}'; DET_TRUST=""
+-  PF_REJECT=""; PF_REJECT_PID=""
++  PF_REJECT=""; PF_REJECT_PID=""; DET_REFUSED_JSON='[]'; DET_REFUSED_N=0
+   # ---------------- 路径 1：PID 文件 ----------------
+   if pidfile_read "$i"; then
+     n="${PF_PID}"
+     if verify_pid_for_job "$i" "$n"; then
+       local st; st="$(proc_starttime "$n" 2>/dev/null || printf '?')"
++      # v3.1 [K]：世代绑定——世代记录存在时，pidfile 指向的 pid/starttime 必须与记录相符，
++      # 否则该 pidfile 是伪造/陈旧的（偷 token 的冒充者最可能的入口）⇒ 拒绝并落到扫描路径。
++      gen_match "$i" "$n" "$st" "$(tok_hash "$IDF_TOKEN_RAW")" >/dev/null
++      if [ "$GEN_MATCH" = token_only ] || [ "$GEN_MATCH" = stale ]; then
++        PF_REJECT="pidfile_generation_mismatch"; PF_REJECT_PID="$n"
++        refuse_adopt "$n" "pidfile_generation_mismatch" pidfile \
++          "$(ev gen_match="$GEN_MATCH" gen_note="$GEN_MATCH_NOTE" gen_pid="$GEN_PID" gen_starttime="$GEN_START" pf_pid="$n" pf_starttime="${PF_START:-?}" proc_starttime="$st" trust="${VERIFY_TRUST:-none}" id_factors="$(printf '%s' "$IDF_JSON")" cmdline="$(proc_cmdline_text "$n")" action=fallthrough_scan note="pidfile 指向的进程不在 keeper 亲启世代（token 单证不足以认领）")"
++      else
+       if [ "$PF_START_VALID" = 1 ] && [ "$st" = "$PF_START" ]; then
+         DET_STATE="running"; DET_PID="$n"; DET_WHY="pidfile_verified"; DET_TRUST="$VERIFY_TRUST"
+-        DET_EV="$(ev source=pidfile pid="$n" starttime="$PF_START" trust="$VERIFY_TRUST" id_factors="$(printf '%s' "$IDF_JSON")" cmdline="$(proc_cmdline_text "$n")")"
++        DET_EV="$(ev source=pidfile pid="$n" starttime="$PF_START" trust="$VERIFY_TRUST" gen_match="$GEN_MATCH" id_factors="$(printf '%s' "$IDF_JSON")" cmdline="$(proc_cmdline_text "$n")")"
+         return
+       fi
+       if [ "$VERIFY_TRUST" = token ]; then
+-        # token 环境指纹吻合 ⇒ 即便 starttime 记录失效/不符，也确认是"我们的这个作业"
++        # token 环境指纹吻合 + 世代相符 ⇒ 即便 starttime 记录失效/不符也是"我们的这个作业"
+         # （PID 复用 + keeper 重启场景）。认领并**修复** pidfile。
++        # v3.1 [K]：无世代记录时不再静默 refresh ⇒ 见下面 gen_match=none 分支。
+         DET_STATE="running"; DET_PID="$n"; DET_TRUST=token
+         if [ "$PF_START_VALID" = 1 ]; then DET_WHY="pidfile_token_verified_starttime_refresh"
+         else DET_WHY="pidfile_token_verified_starttime_repaired"; fi
+-        DET_EV="$(ev source=pidfile pid="$n" pf_starttime="${PF_START:-?}" proc_starttime="$st" trust=token id_factors="$(printf '%s' "$IDF_JSON")" decision=adopt_token_repair cmdline="$(proc_cmdline_text "$n")")"
++        DET_EV="$(ev source=pidfile pid="$n" pf_starttime="${PF_START:-?}" proc_starttime="$st" trust=token gen_match="$GEN_MATCH" decision=adopt_token_repair cmdline="$(proc_cmdline_text "$n")")"
++        if [ "$GEN_MATCH" = none ]; then
++          note_adopt_unverified "$n" "$VERIFY_TRUST" "pidfile_generation_unbound" \
++            "$(ev gen_match=none gen_note="$GEN_MATCH_NOTE" note="token 单证（无 keeper 亲启世代记录）：认领但显式标注不可验证，非静默")"
++        fi
+         return
+       fi
+       # 无 token 而 starttime 无效/不符 ⇒ pidfile **不可信**（v2 在此静默认领 ⇒ S2 洞）
+       if [ "$PF_START_VALID" = 1 ]; then
+         PF_REJECT="pidfile_starttime_mismatch"; PF_REJECT_PID="$n"
+         audit pidfile_untrusted "$n" - \
+-          "$(ev source=pidfile pid="$n" pf_starttime="$PF_START" proc_starttime="$st" reason=starttime_mismatch_no_token trust="${VERIFY_TRUST:-none}" id_factors="$(printf '%s' "$IDF_JSON")" action=fallthrough_scan note="v2 在此按 PID 复用静默认领（R1 crit S2）；v3 降级为不可信，改走扫描+分级证据")"
++          "$(ev source=pidfile pid="$n" pf_starttime="$PF_START" proc_starttime="$st" reason=starttime_mismatch_no_token trust="${VERIFY_TRUST:-none}" gen_match="$GEN_MATCH" id_factors="$(printf '%s' "$IDF_JSON")" action=fallthrough_scan note="v2 在此按 PID 复用静默认领（R1 crit S2）；v3 降级为不可信，改走扫描+分级证据")"
+       else
+         PF_REJECT="pidfile_starttime_invalid"; PF_REJECT_PID="$n"
+         audit pidfile_untrusted "$n" - \
+-          "$(ev source=pidfile pid="$n" pf_starttime="${PF_START:-empty}" reason=starttime_invalid_no_token trust="${VERIFY_TRUST:-none}" id_factors="$(printf '%s' "$IDF_JSON")" action=fallthrough_scan note="starttime 缺失/\`?\` 不再被当作'跳过校验'（R1 crit E3.3）")"
++          "$(ev source=pidfile pid="$n" pf_starttime="${PF_START:-empty}" reason=starttime_invalid_no_token trust="${VERIFY_TRUST:-none}" gen_match="$GEN_MATCH" id_factors="$(printf '%s' "$IDF_JSON")" action=fallthrough_scan note="starttime 缺失/\`?\` 不再被当作'跳过校验'（R1 crit E3.3）")"
+       fi
++      fi   # end v3.1 世代绑定
+       # 落到路径 2
+     else
+       # PID 文件指向的进程不成立：stale / PID 复用 / 无关进程
+@@ -655,6 +748,7 @@
+   # ---------------- 路径 2：扫描认领（分级证据 + 拒绝出证） ----------------
+   scan_candidates "$i"
+   local accepted="" acc_trust="" strong="" strong_trust="" refused_ev="" cnt=0 acc_cnt=0
++  local gen_strong=0 cand_st cand_th
+   for cand in $CAND_PIDS; do
+     cnt=$((cnt+1))
+     if ! verify_pid_for_job "$i" "$cand"; then
+@@ -674,10 +768,26 @@
+       esac
+       continue      # 其他不符（argv 不匹配等）：不算候选，静默跳过
+     fi
++    # ---- v3.1 [K]：世代绑定（token 单证不得静默认领）----
++    cand_st="$(proc_starttime "$cand" 2>/dev/null || printf '?')"
++    cand_th="$(tok_hash "$IDF_TOKEN_RAW")"
++    gen_match "$i" "$cand" "$cand_st" "$cand_th" >/dev/null
++    if [ "$KEEPER_GEN_BIND" = 1 ] && [ "$GEN_MATCH" != exact ] && [ "$GEN_MATCH" != none ]; then
++      # 身份证据看起来像本作业（argv/cwd/exe 乃至 token 都命中），但不在 keeper 亲启世代里：
++      # 典型形态 = 偷了 token 的冒充者 / 手工另起的副本 / PID+starttime 不可关联的进程。
++      # 拒绝认领（绝不静默），真作业若缺席则由 cycle 的重启路径照常拉起。
++      local rsn="stranger_candidate"
++      [ "$GEN_MATCH" = token_only ] && rsn="stranger_token"
++      refuse_adopt "$cand" "$rsn" scan \
++        "$(ev gen_match="$GEN_MATCH" gen_note="$GEN_MATCH_NOTE" gen_pid="$GEN_PID" gen_starttime="$GEN_START" gen_spawn_ms="$GEN_MS" cand_pid="$cand" cand_starttime="$cand_st" trust="$VERIFY_TRUST" id_factors="$(printf '%s' "$IDF_JSON")" cmdline="$(proc_cmdline_text "$cand")" action=refuse_adopt note="世代记录存在且不一致：token/路径证据不足以认领（c1 冒充防护）")"
++      refused_ev+="$(ev pid="$cand" reason="$rsn" gen_match="$GEN_MATCH") "
++      continue
++    fi
+     case "$VERIFY_TRUST" in
+       token)           strong+="$cand "; strong_trust=token ;;
+       path_verified|relative_cwd_ok)
+-        accepted+="$cand "; acc_trust="$VERIFY_TRUST"; acc_cnt=$((acc_cnt+1)) ;;
++        if [ "$GEN_MATCH" = exact ]; then strong+="$cand "; strong_trust="$VERIFY_TRUST"; gen_strong=1
++        else accepted+="$cand "; acc_trust="$VERIFY_TRUST"; acc_cnt=$((acc_cnt+1)); fi ;;
+       legacy_loose)
+         if [ "$KEEPER_ADOPT_LEGACY" = 1 ] && [ "$KEEPER_ADOPT_LOOSE" = 1 ]; then
+           # 不在此出证：认领与否要等"唯一候选"判决；出证统一放在 cycle 的认领分支
+@@ -693,9 +803,12 @@
+   done
+   local scnt=0; for cand in $strong; do scnt=$((scnt+1)); done
+   local refused_json='[]'; [ -n "$refused_ev" ] && refused_json="[$refused_ev]"
++  DET_REFUSED_JSON="$refused_json"
++  DET_REFUSED_N="$(printf '%s' "$refused_json" | grep -o '"pid":' | wc -l | tr -d ' ')"
+   if [ "$scnt" -eq 1 ]; then
+-    DET_STATE="running"; DET_PID="${strong% }"; DET_WHY="adopt_token"; DET_TRUST="$strong_trust"
+-    DET_EV="$(ev source=proc_scan adopted=1 pid="$DET_PID" trust=token pidfile_rejected="${PF_REJECT:-none}" refused="$refused_json" cmdline="$(proc_cmdline_text "$DET_PID")")"
++    DET_STATE="running"; DET_PID="${strong% }"; DET_TRUST="$strong_trust"
++    if [ "$gen_strong" = 1 ]; then DET_WHY="adopt_generation"; else DET_WHY="adopt_token"; fi
++    DET_EV="$(ev source=proc_scan adopted=1 pid="$DET_PID" trust="$strong_trust" gen_bound="$([ "$gen_strong" = 1 ] && printf exact || printf token)" pidfile_rejected="${PF_REJECT:-none}" refused="$refused_json" cmdline="$(proc_cmdline_text "$DET_PID")")"
+     return
+   fi
+   if [ "$scnt" -gt 1 ]; then
+@@ -724,6 +837,376 @@
+   DET_EV="$(ev source=proc_scan candidates="${accepted% }" count="$acc_cnt" pidfile_rejected="${PF_REJECT:-none}" refused="$refused_json")"
+ }
+ 
++# ================= v3.1 [J] 机器化终态判据（F6 闭环）======================
++# 契约依据：audit-selfheal §4.3.2「只认结构化终态，禁止 grep 日志」；crit-correct K-3。
++# 五条事实来源（优先级从高到低，全部落结构化记录）：
++#   1) gen/<job>.rec    —— keeper 亲启世代（pid + starttime + token 哈希 + spawn 时刻）
++#   2) wait <pid>       —— 直接子进程的真实退出码（信号死 = 128+N），并回收僵尸
++#   3) jobexit/<job>.json —— 上一次 keeper 实测到的退出码（跨 keeper 重启可复核）
++#   4) convergence-report.json —— decided/terminal/exit_code（新鲜度门槛见 conv_report_read）
++#   5) 兼容降级（默认关）：grep 完成标记，仅当 KEEPER_COMPAT_GREP=1
++GEN_PRESENT=0; GEN_PID=""; GEN_START=""; GEN_TOKHASH=""; GEN_MS=0; GEN_FILE=""; GEN_KEEPER_PID=""
++GEN_MATCH="none"; GEN_MATCH_NOTE=""
++CONV_OK=0; CONV_PATH=""; CONV_DECIDED=""; CONV_EXIT=""; CONV_TERMINAL=""; CONV_PID=""
++CONV_RUN=""; CONV_REASON=""; CONV_MTIME_MS=0; CONV_STALE=0
++V_VERDICT=""; V_EXIT=""; V_SOURCE="none"; V_DECIDED=""; V_REASON=""; V_CONFLICT=0
++TERM_FINAL=0; TERM_VERDICT=""; TERM_EXIT=""; TERM_SOURCE=""; TERM_DECIDED=""; COMPAT_GREP_HIT=0
++declare -A CHILD_OWNED=()          # 本 keeper 进程亲启的子进程 pid（wait 取退出码的前提）
++_skey() { printf '%s/%s' "$KEEPER_STATE_DIR" "$1"; }
++gen_rec_path()   { printf '%s/gen/%s.rec' "$KEEPER_STATE_DIR" "${JOB_NAME[$1]}"; }
++terminal_path()  { printf '%s/terminal/%s.json' "$KEEPER_STATE_DIR" "${JOB_NAME[$1]}"; }
++halt_path()      { printf '%s/halt/%s.json' "$KEEPER_STATE_DIR" "${JOB_NAME[$1]}"; }
++jobexit_path()   { printf '%s/jobexit/%s.json' "$KEEPER_STATE_DIR" "${JOB_NAME[$1]}"; }
++tok_hash() { # TOKEN → 16 位摘要（不落明文 token，避免 state 目录二次泄密）
++  local t="${1:-}"
++  [ -n "$t" ] || { printf ''; return 0; }
++  printf '%s' "$t" | sha256sum 2>/dev/null | cut -c1-16
++}
++# gen_rec_write IDX PID TOKEN —— 记录"keeper 亲启世代"。原子写。
++gen_rec_write() {
++  local i="$1" p="$2" tok="${3:-}" f tmp h
++  f="$(gen_rec_path "$i")"; tmp="$f.tmp.$$"; h="$(tok_hash "$tok")"
++  mkdir -p "$(dirname "$f")" 2>/dev/null
++  printf 'pid=%s starttime=%s tok_hash=%s spawn_ms=%s keeper_pid=%s job=%s ts=%s\n' \
++    "$p" "$(proc_starttime "$p" 2>/dev/null || printf '?')" "$h" "$(now_ms)" "$$" "${JOB_NAME[$i]}" "$(now_iso)" \
++    >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
++  return 0
++}
++# gen_rec_read IDX —— 解析世代记录（缺失时 GEN_PRESENT=0，不报错）
++gen_rec_read() {
++  local i="$1" f w k v raw
++  GEN_PRESENT=0; GEN_PID=""; GEN_START=""; GEN_TOKHASH=""; GEN_MS=0; GEN_FILE=""; GEN_KEEPER_PID=""
++  f="$(gen_rec_path "$i")"; GEN_FILE="$f"
++  [ -r "$f" ] || return 1
++  raw="$(head -c 512 "$f" 2>/dev/null | tr -d '\n')"; [ -n "$raw" ] || return 1
++  for w in $raw; do
++    k="${w%%=*}"; v="${w#*=}"
++    case "$k" in
++      pid) GEN_PID="$v" ;; starttime) GEN_START="$v" ;; tok_hash) GEN_TOKHASH="$v" ;;
++      spawn_ms) GEN_MS="$v" ;; keeper_pid) GEN_KEEPER_PID="$v" ;;
++    esac
++  done
++  [[ "$GEN_PID" =~ ^[0-9]+$ ]] || return 1
++  GEN_PRESENT=1; return 0
++}
++# gen_match IDX CAND_PID CAND_START CAND_TOKHASH —— 候选进程与该作业世代的符合度
++#   打印 exact | stale | token_only | none（并设置 GEN_MATCH + GEN_MATCH_NOTE）
++gen_match() {
++  local i="$1" cp="$2" cs="${3:-}" ch="${4:-}"
++  GEN_MATCH="none"; GEN_MATCH_NOTE=""
++  gen_rec_read "$i" || { GEN_MATCH="none"; GEN_MATCH_NOTE="no_generation_record"; printf 'none'; return 0; }
++  if [ "$cp" = "$GEN_PID" ] && [ -n "$cs" ] && [ "$cs" = "$GEN_START" ]; then
++    if [ -n "$ch" ] && [ -n "$GEN_TOKHASH" ] && [ "$ch" != "$GEN_TOKHASH" ]; then
++      GEN_MATCH="none"; GEN_MATCH_NOTE="same_pid_starttime_but_token_hash_differs"; printf 'none'; return 0
++    fi
++    GEN_MATCH="exact"; GEN_MATCH_NOTE="pid+starttime(+token_hash)_match"; printf 'exact'; return 0
++  fi
++  if [ -n "$ch" ] && [ -n "$GEN_TOKHASH" ] && [ "$ch" = "$GEN_TOKHASH" ]; then
++    GEN_MATCH="token_only"; GEN_MATCH_NOTE="token_hash_match_pid_or_starttime_mismatch(rec_pid=$GEN_PID rec_start=$GEN_START cand_pid=$cp cand_start=${cs:-?})"
++    printf 'token_only'; return 0
++  fi
++  GEN_MATCH="stale"; GEN_MATCH_NOTE="neither_pid_starttime_nor_token_hash(rec_pid=$GEN_PID cand_pid=$cp)"
++  printf 'stale'
++}
++# gen_binding_ok IDX CAND_PID CAND_START CAND_TOKHASH STRENGTH —— 该候选是否可被认领为"我们的作业"
++#   0=可以（exact / 无世代记录的 legacy 通道）；1=拒绝（并给出 GEN_MATCH_NOTE）
++gen_binding_ok() {
++  local i="$1" m
++  [ "$KEEPER_GEN_BIND" = 1 ] || { GEN_MATCH="unbound"; GEN_MATCH_NOTE="gen_bind_disabled"; return 0; }
++  m="$(gen_match "$i" "$2" "${3:-}" "${4:-}")"
++  case "$m" in
++    exact)     return 0 ;;
++    none)      return 0 ;;   # 无世代记录：legacy 通道（调用方必须写 adopt_unverified）
++    token_only|stale) return 1 ;;
++    *)         return 1 ;;
++  esac
++}
++# conv_report_path IDX —— 作业的结构化终态报告路径（KEEPER_CONV_REPORT 覆盖；"-"=禁用）
++conv_report_path() {
++  local i="$1" p="${JOB_CONV_REPORT[$i]:-}"
++  [ "$p" = "-" ] && { printf ''; return 0; }
++  if [ -z "$p" ]; then
++    p="${KEEPER_CONV_REPORT:-}"
++    [ "$p" = "-" ] && { printf ''; return 0; }
++  fi
++  [ -n "$p" ] || p="$(dirname "${JOB_COMPLOG[$i]}")/convergence-report.json"
++  printf '%s' "$p"
++}
++# conv_report_read IDX SPAWN_MS JUDGE_PID —— 读结构化终态（decided/terminal/exit_code/pid/run）
++#   新鲜度：mtime ≥ SPAWN_MS 或 报告内 pid == JUDGE_PID；否则 CONV_STALE=1（绝不采信陈旧结论）
++conv_report_read() {
++  local i="$1" spawn_ms="${2:-0}" jpid="${3:-}" kv mt
++  CONV_OK=0; CONV_DECIDED=""; CONV_EXIT=""; CONV_TERMINAL=""; CONV_PID=""; CONV_RUN=""
++  CONV_REASON=""; CONV_MTIME_MS=0; CONV_STALE=0; CONV_PATH="$(conv_report_path "$i")"
++  [ -n "$CONV_PATH" ] && [ -r "$CONV_PATH" ] || return 1
++  command -v python3 >/dev/null 2>&1 || return 1
++  mt="$(stat -c %Y "$CONV_PATH" 2>/dev/null || printf 0)"; CONV_MTIME_MS=$(( mt * 1000 ))
++  kv="$(timeout "$KEEPER_HB_TIMEOUT" python3 - "$CONV_PATH" <<'PY' 2>/dev/null
++import json, sys
++try:
++    d = json.load(open(sys.argv[1], encoding="utf-8"))
++except Exception:
++    sys.exit(0)
++if not isinstance(d, dict):
++    sys.exit(0)
++def g(k):
++    v = d.get(k)
++    return "" if v is None else v
++for k in ("schema", "decided", "exit_code", "pid", "run", "reason"):
++    print("conv_%s=%s" % (k, g(k)))
++print("conv_terminal=%s" % (1 if d.get("terminal") else 0))
++PY
++)" || kv=""
++  [ -n "$kv" ] || return 1
++  local line k v
++  while IFS= read -r line; do
++    [ -n "$line" ] || continue
++    k="${line%%=*}"; v="${line#*=}"
++    case "$k" in
++      conv_decided) CONV_DECIDED="$v" ;; conv_exit_code) CONV_EXIT="$v" ;;
++      conv_terminal) CONV_TERMINAL="$v" ;; conv_pid) CONV_PID="$v" ;;
++      conv_run) CONV_RUN="$v" ;; conv_reason) CONV_REASON="$v" ;;
++    esac
++  done <<<"$kv"
++  CONV_OK=1
++  [[ "$CONV_EXIT" =~ ^-?[0-9]+$ ]] || CONV_EXIT=""
++  if [ -n "$jpid" ] && [ "$CONV_PID" = "$jpid" ]; then
++    CONV_STALE=0
++  elif [ "$CONV_MTIME_MS" -ge "${spawn_ms:-0}" ] 2>/dev/null && [ "${spawn_ms:-0}" -gt 0 ]; then
++    CONV_STALE=0
++  else
++    CONV_STALE=1
++  fi
++  return 0
++}
++# proc_exited PID —— 0=已退出（/proc 消失或僵尸）；1=仍在运行
++proc_exited() {
++  local p="$1" st
++  [ -n "$p" ] || return 1
++  [ -d "/proc/$p" ] || return 0
++  st="$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)"
++  [ "$st" = "Z" ] && return 0
++  return 1
++}
++# job_exit_capture IDX PID —— 取退出码（wait 优先，其次持久化 jobexit 记录）；打印码或空
++job_exit_capture() {
++  local i="$1" p="$2" rc="" sig=0 fid
++  V_SOURCE="none"
++  [ -n "$p" ] || return 1
++  proc_exited "$p" || return 1
++  if [ "${CHILD_OWNED[$p]:-0}" = 1 ]; then
++    wait "$p" 2>/dev/null; rc=$?
++    if [ "$rc" != 127 ]; then
++      [ "$rc" -ge 128 ] && sig=$(( rc - 128 ))
++      jobexit_write "$i" "$p" "$rc" "$sig" wait
++      V_SOURCE="wait"; printf '%s' "$rc"; return 0
++    fi
++  fi
++  fid="$(jobexit_read "$i" "$p")"
++  if [ -n "$fid" ]; then V_SOURCE="jobexit_record"; printf '%s' "$fid"; return 0; fi
++  return 1
++}
++jobexit_write() { # IDX PID EXIT SIGNAL SOURCE
++  local i="$1" p="$2" rc="$3" sig="$4" src="$5" f tmp
++  f="$(jobexit_path "$i")"; tmp="$f.tmp.$$"
++  mkdir -p "$(dirname "$f")" 2>/dev/null
++  printf '{"schema":"keeper-jobexit/1","job":"%s","pid":%s,"starttime":"%s","exit_code":%s,"signal":%s,"source":"%s","keeper_pid":%s,"ts":"%s","ts_epoch":%s}\n' \
++    "$(jesc "${JOB_NAME[$i]}")" "$p" "$(proc_starttime "$p" 2>/dev/null || printf '?')" "$rc" "$sig" "$(jesc "$src")" "$$" "$(now_iso)" "$(epoch_s)" \
++    >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
++}
++# jobexit_read IDX PID —— 记录里的退出码（pid 必须与记录一致；记录缺失/不符返回空）
++jobexit_read() {
++  local i="$1" p="$2" f raw rp re
++  f="$(jobexit_path "$i")"; [ -r "$f" ] || return 1
++  raw="$(head -c 512 "$f" 2>/dev/null | tr -d '\n')"; [ -n "$raw" ] || return 1
++  rp="$(printf '%s' "$raw" | sed -n 's/.*"pid":\([0-9]*\).*/\1/p')"
++  re="$(printf '%s' "$raw" | sed -n 's/.*"exit_code":\([0-9]*\).*/\1/p')"
++  [ -n "$re" ] || return 1
++  [ -n "$p" ] && [ "$rp" != "$p" ] && return 1
++  printf '%s' "$re"
++}
++# terminal_write IDX VERDICT EXIT SOURCE DECIDED REASON —— 终态记录（原子写；JSON 单行扁平）
++terminal_write() {
++  local i="$1" v="$2" x="$3" src="$4" dec="$5" rsn="$6" f tmp
++  f="$(terminal_path "$i")"; tmp="$f.tmp.$$"
++  mkdir -p "$(dirname "$f")" 2>/dev/null
++  printf '{"schema":"keeper-job-terminal/1","job":"%s","verdict":"%s","exit_code":%s,"source":"%s","decided":"%s","reason":"%s","pid":%s,"starttime":"%s","incomplete_restarts":%s,"resume_restarts":%s,"restarts":%s,"ts":"%s","ts_epoch":%s}\n' \
++    "$(jesc "${JOB_NAME[$i]}")" "$(jesc "$v")" "${x:--1}" "$(jesc "$src")" "$(jesc "${dec:-none}")" "$(jesc "$rsn")" \
++    "${GEN_PID:-0}" "${GEN_START:-?}" "$(st_get "incomplete_restarts_${JOB_NAME[$i]}")" "$(st_get "resume_restarts_${JOB_NAME[$i]}")" "$(st_get "restarts_${JOB_NAME[$i]}")" \
++    "$(now_iso)" "$(epoch_s)" >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
++}
++# terminal_read IDX —— 从磁盘终态记录恢复事实（keeper 换 state 目录/首次上任时用）
++terminal_read() {
++  local i="$1" f raw
++  TERM_FINAL=0; TERM_VERDICT=""; TERM_EXIT=""; TERM_DECIDED=""; TERM_SOURCE=""
++  f="$(terminal_path "$i")"; [ -r "$f" ] || return 1
++  raw="$(head -c 1024 "$f" 2>/dev/null | tr -d '\n')"; [ -n "$raw" ] || return 1
++  TERM_VERDICT="$(printf '%s' "$raw" | sed -n 's/.*"verdict":"\([a-z_]*\)".*/\1/p')"
++  [ -n "$TERM_VERDICT" ] || return 1
++  TERM_EXIT="$(printf '%s' "$raw" | sed -n 's/.*"exit_code":\(-\{0,1\}[0-9]*\).*/\1/p')"
++  TERM_DECIDED="$(printf '%s' "$raw" | sed -n 's/.*"decided":"\([a-z_-]*\)".*/\1/p')"
++  TERM_SOURCE=record; TERM_FINAL=1
++  return 0
++}
++halt_write() { # IDX REASON DETAIL DEAD_PID
++  local i="$1" rsn="$2" det="$3" dead="$4" f tmp
++  f="$(halt_path "$i")"; tmp="$f.tmp.$$"
++  mkdir -p "$(dirname "$f")" 2>/dev/null
++  printf '{"schema":"keeper-job-halt/1","job":"%s","reason":"%s","detail":"%s","dead_pid":"%s","budgets":{"startretries":%s,"incomplete_retries":%s,"fail_count":%s,"incomplete_restarts":%s},"ts":"%s","ts_epoch":%s,"resume_hint":"bash keeper-v3.sh resume %s"}\n' \
++    "$(jesc "${JOB_NAME[$i]}")" "$(jesc "$rsn")" "$(jesc "$det")" "$(jesc "${dead:-0}")" \
++    "$KEEPER_START_RETRIES" "$KEEPER_INCOMPLETE_RETRIES" "$(st_get "fail_${JOB_NAME[$i]}")" "$(st_get "incomplete_restarts_${JOB_NAME[$i]}")" \
++    "$(now_iso)" "$(epoch_s)" "$(jesc "${JOB_NAME[$i]}")" >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
++}
++# job_settled IDX —— 0=已终态/已停机（不再巡检重启）；设置 TERM_* / COMPAT_GREP_HIT
++job_settled() {
++  local i="$1" job="${JOB_NAME[$i]}" st
++  TERM_FINAL=0; TERM_VERDICT=""; TERM_EXIT=""; TERM_SOURCE=""; TERM_DECIDED=""; COMPAT_GREP_HIT=0
++  st="$(st_get "terminal_${job}")"
++  case "$st" in
++    converged|halted)
++      TERM_FINAL=1; TERM_VERDICT="$st"; TERM_EXIT="$(st_get "exit_code_${job}")"; TERM_SOURCE=state; return 0 ;;
++  esac
++  if [ "$(st_get "halted_${job}")" = 1 ]; then
++    TERM_FINAL=1; TERM_VERDICT="halted"; TERM_EXIT="$(st_get "exit_code_${job}")"; TERM_SOURCE=state; return 0
++  fi
++  if terminal_read "$i"; then     # 磁盘终态（state 被清/新 keeper 上任）
++    st_set "terminal_${job}" "$TERM_VERDICT"; st_set "exit_code_${job}" "${TERM_EXIT:--1}"
++    return 0
++  fi
++  if [ "$KEEPER_COMPAT_GREP" = 1 ] && job_complete "$i"; then
++    TERM_FINAL=1; TERM_VERDICT="completed_marker"; TERM_SOURCE=compat_grep; COMPAT_GREP_HIT=1; return 0
++  fi
++  return 1
++}
++job_settled_state() { # IDX → completed | halted
++  local i="$1"
++  case "$(st_get "terminal_${JOB_NAME[$i]}")" in
++    halted) printf 'halted' ;;
++    *)      [ "$(st_get "halted_${JOB_NAME[$i]}")" = 1 ] && printf 'halted' || printf 'completed' ;;
++  esac
++}
++# job_verdict_compute IDX —— 汇总"这个作业为什么结束了"（退出码 + 结构化终态 + 冲突标注）
++job_verdict_compute() {
++  local i="$1" job="${JOB_NAME[$i]}" rc="" conv_code="" gpid gstart
++  V_VERDICT="unknown"; V_EXIT=""; V_SOURCE="none"; V_DECIDED=""; V_REASON=""; V_CONFLICT=0
++  gen_rec_read "$i"; gpid="${GEN_PID:-}"; gstart="${GEN_START:-}"
++  # (1) 退出码：wait（OS 事实）→ jobexit 记录
++  if rc="$(job_exit_capture "$i" "$gpid")"; then :; else rc=""; fi
++  # (2) 结构化终态报告（宽限窗口内等它落盘）
++  conv_report_read "$i" "${GEN_MS:-0}" "$gpid" || true
++  if [ "$CONV_OK" = 1 ] && [ "$CONV_STALE" != 1 ] && [ "$CONV_TERMINAL" = 1 ] && [ -z "$rc" ]; then
++    local w=0
++    while [ "$w" -lt $(( KEEPER_EXIT_GRACE_MS )) ] && [ -z "$CONV_EXIT" ]; do
++      sleep 0.25 9>&-; w=$(( w + 250 ))
++      conv_report_read "$i" "${GEN_MS:-0}" "$gpid" || break
++      [ "$CONV_TERMINAL" = 1 ] || break
++    done
++  fi
++  [ -n "$rc" ] && { V_EXIT="$rc"; V_SOURCE="$( [ "${V_SOURCE:-none}" = none ] && printf wait || printf '%s' "$V_SOURCE" )"; }
++  if [ "$CONV_OK" = 1 ] && [ "$CONV_STALE" = 1 ] && [ -n "$CONV_DECIDED" ]; then
++    # 审计节流：同一 mtime 只出证一次（否则每轮巡检都会刷同一条 stale 告警）
++    local key_stale="stale_report_mtime_${job}"
++    if [ "$(st_get "$key_stale")" != "$CONV_MTIME_MS" ]; then
++      st_set "$key_stale" "$CONV_MTIME_MS"
++      audit keeper_terminal_report_stale "$gpid" - \
++        "$(ev job="$job" report="$CONV_PATH" report_pid="${CONV_PID:-0}" report_decided="${CONV_DECIDED:-none}" spawn_ms="${GEN_MS:-0}" mtime_ms="$CONV_MTIME_MS" action=ignore note="结构化终态报告早于本次 spawn 或 pid 不可关联 ⇒ 标 stale，不采信（同 mtime 只审计一次）")"
++    fi
++  fi
++  if [ "$CONV_OK" = 1 ] && [ "$CONV_STALE" != 1 ] && [ "$CONV_TERMINAL" = 1 ]; then
++    V_DECIDED="$CONV_DECIDED"; V_REASON="${CONV_REASON:-report_terminal}"
++    conv_code="$CONV_EXIT"
++    if [ -z "$V_EXIT" ] && [ -n "$conv_code" ]; then V_EXIT="$conv_code"; V_SOURCE="convergence_report"; fi
++    [ -n "$V_EXIT" ] && [ -n "$conv_code" ] && [ "$V_EXIT" != "$conv_code" ] && V_CONFLICT=1
++  fi
++  [ -n "$V_SOURCE" ] || V_SOURCE="none"
++  if [ "$V_DECIDED" = done ] && [ "$CONV_EXIT" = 0 ] && [ "$CONV_OK" = 1 ] && [ "$CONV_STALE" != 1 ]; then
++    # converge 自己的终态报告（decided=done & exit 0）是权威机器结论：即便被信号打断，
++    # 数据也已收敛（仅记 channel_conflict 证据，不误判为崩溃而重启）。
++    V_VERDICT="converged"; [ -z "$V_EXIT" ] && V_EXIT=0
++    [ "$V_EXIT" != 0 ] && V_CONFLICT=1
++    return 0
++  fi
++  case "${V_EXIT:-}" in
++    '')  V_VERDICT="unknown" ;;
++    0)   V_VERDICT="converged" ;;
++    3)   V_VERDICT="incomplete" ;;
++    4)   V_VERDICT="stall_stop" ;;
++    12[6-9]|1[3-9][0-9]|2[0-5][0-9]) V_VERDICT="signal" ;;
++    *)   V_VERDICT="crash" ;;
++  esac
++  [ "$V_VERDICT" = converged ] && [ "$V_DECIDED" != done ] && [ -n "$V_DECIDED" ] && V_CONFLICT=1
++  return 0
++}
++# job_stop_converged IDX EXIT SOURCE DECIDED —— 完成停止（终态审计 + 状态文件）
++job_stop_converged() {
++  local i="$1" x="$2" src="$3" dec="$4" job="${JOB_NAME[$i]}"
++  st_set "terminal_${job}" converged; st_set "exit_code_${job}" "${x:--1}"
++  st_set "last_state_${job}" completed; st_set "fail_${job}" 0
++  terminal_write "$i" converged "$x" "$src" "$dec" "converged_p0"
++  audit keeper_job_stop "${GEN_PID:-}" - \
++    "$(evcat "$(ev job="$job" verdict=converged exit_code="${x:--1}" decided="${dec:-none}" source="$src" action=stop_no_restart generation="${GEN_PID:-0}" gen_starttime="${GEN_START:-?}" terminal_file="$(terminal_path "$i")" note="机器判据：退出码 0 / decided=done ⇒ 完成停机（不再重启）；grep 标记不作为主判据")" "$(comp_evidence "$i")")" \
++    process "$(ev job="$job" verdict=converged exit_code="${x:--1}" decided="${dec:-none}" source="$src")"
++}
++# job_halt IDX REASON DETAIL DEAD_PID —— 停机告警（停止重启 + 状态文件 + 审计）
++job_halt() {
++  local i="$1" rsn="$2" det="$3" dead="${4:-}" job="${JOB_NAME[$i]}"
++  st_set "halted_${job}" 1; st_set "halt_reason_${job}" "$rsn"; st_set "last_state_${job}" halted
++  halt_write "$i" "$rsn" "$det" "$dead"
++  audit keeper_job_halt "$dead" - \
++    "$(ev job="$job" reason="$rsn" detail="$det" dead_pid="${dead:-0}" action=stop_restarting halted=1 halt_file="$(halt_path "$i")" startretries="$KEEPER_START_RETRIES" incomplete_retries="$KEEPER_INCOMPLETE_RETRIES" fail_count="$(st_get "fail_${job}")" note="重启预算/有限重启预算耗尽 ⇒ 停止重启并升级告警（防空转循环）；解除：keeper-v3.sh resume $job")" \
++    process "$(ev job="$job" reason="$rsn" action=halt)"
++}
++# job_restart_audit IDX FROM_PID TO_PID REASON KIND EXTRA_EV —— 统一的 keeper_restart 审计
++job_restart_audit() {
++  local i="$1" from="$2" to="$3" rsn="$4" kind="$5" extra="${6:-}"
++  audit restart "$from" "$to" \
++    "$(evcat "$(ev reason="$rsn" kind="$kind" script="${JOB_SCRIPT[$i]}" total_restarts="$(st_get "restarts_${JOB_NAME[$i]}")" spawn_verify_ms="${SPAWN_ALIVE_MS:-0}" deadline_ms=$((KEEPER_RECOVERY_DEADLINE*1000)) spawn_trust="${SPAWN_TRUST:-unknown}")" "$extra")" \
++    process "$(ev from_pid="${from:-0}" to_pid="$to" reason="$rsn" kind="$kind" recovery_ms="${SPAWN_ALIVE_MS:-0}")"
++}
++# job_limited_restart IDX DEAD_PID KIND(exit3|exit4) EXIT DECIDED —— 有限重启；超限 ⇒ 停机告警
++#   0=已重启 1=已停机（调用方据此 continue）
++job_limited_restart() {
++  local i="$1" dead="$2" kind="$3" x="$4" dec="$5" job="${JOB_NAME[$i]}"
++  local key limit counter rc t0 t1
++  case "$kind" in
++    exit3) key="incomplete_restarts_${job}"; limit="$KEEPER_INCOMPLETE_RETRIES" ;;
++    exit4) key="resume_restarts_${job}";     limit="$KEEPER_START_RETRIES" ;;
++    *)     key="incomplete_restarts_${job}"; limit="$KEEPER_INCOMPLETE_RETRIES" ;;
++  esac
++  counter="$(st_get "$key")"
++  if [ "$counter" -ge "$limit" ] 2>/dev/null; then
++    st_set "exit_code_${job}" "${x:--1}"
++    job_halt "$i" "${kind}_budget_exhausted" "attempts=$counter/$limit exit_code=${x:--1} decided=${dec:-none}" "$dead"
++    audit keeper_restart_budget_exhausted "$dead" - \
++      "$(ev job="$job" kind="$kind" attempts="$counter" limit="$limit" exit_code="${x:--1}" action=halt note="有限重启预算耗尽：停机告警而非无界重启（K-3 的'无界重启循环'在此闭环）")" \
++      process "$(ev job="$job" kind="$kind" attempts="$counter" limit="$limit")"
++    return 1
++  fi
++  st_set "$key" "$(( counter + 1 ))"
++  st_set "fail_${job}" 0            # 判据重启不是崩溃，重置秒死计数
++  audit keeper_restart_budget "$dead" - \
++    "$(ev job="$job" kind="$kind" attempt="$(( counter + 1 ))" limit="$limit" exit_code="${x:--1}" decided="${dec:-none}" note="按退出码判据的有限重启（resume/未收敛重试）")"
++  t0="$(now_ms)"; spawn_job "$i"; rc=$?; t1="$(now_ms)"; SPAWN_ALIVE_MS=$(( t1 - t0 ))
++  if [ "$rc" = 0 ]; then
++    pidfile_write "$i" "$SPAWN_PID" spawned_by=keeper
++    st_set "restarts_${job}" "$(( $(st_get "restarts_${job}") + 1 ))"
++    st_set "last_spawn_ms_${job}" "$t1"; st_set "last_pid_${job}" "$SPAWN_PID"; st_set "last_alive_ms_${job}" "$t1"
++    st_set "last_state_${job}" running
++    job_restart_audit "$i" "$dead" "$SPAWN_PID" "${kind}_verdict(exit=${x:--1})" "$kind" \
++      "$(ev exit_code="${x:--1}" decided="${dec:-none}" verdict_source="${V_SOURCE:-none}" note="退出码判据驱动的重启（非崩溃路径）")"
++    CYCLE_SPAWNS=$((CYCLE_SPAWNS+1))
++    heartbeat_cycle "$i" "$SPAWN_PID" "${SPAWN_TRUST:-unknown}"
++  elif [ "$rc" = 2 ]; then
++    st_set "last_state_${job}" dry_run
++    audit restart_dry_run "$dead" - "$(ev reason="${kind}_verdict" detail="$SPAWN_WHY")"
++  else
++    st_set "last_state_${job}" spawn_failed; st_set "last_spawn_ms_${job}" "$t1"
++    audit restart_failed "$dead" - "$(ev reason="${kind}_verdict" spawn_why="$SPAWN_WHY" spawn_ms="$SPAWN_ALIVE_MS")"
++  fi
++  return 0
++}
++SPAWN_ALIVE_MS=0; SPAWN_TOKEN=""
++
+ # --------------------------------------------------------------- 完成守卫 --
+ # 守卫语义（与 v1 一致，刻意保持）：完成标记存在 ⇒ 永不重启
+ job_complete() {
+@@ -822,9 +1305,10 @@
+ env_probe() {
+   local i miss=""
+   for ((i=0; i<${#JOB_NAME[@]}; i++)); do
+-    # 已完成作业（守卫判定无需再动作）不参与探针：其脚本被归档/改名属正常，
++    # 已终态/已停机作业（守卫判定无需再动作）不参与探针：其脚本被归档/改名属正常，
+     # 不能因此判定"环境异常"（否则 STRICT_ENV=1 会在收尾阶段误退出）。
+-    job_complete "$i" && continue
++    # v3.1：判据与 cycle 一致（job_settled = 机器终态 / 停机 / 兼容 grep）。
++    job_settled "$i" && continue
+     [ -f "${JOB_SCRIPT[$i]}" ] || miss+="${JOB_NAME[$i]}:script(${JOB_SCRIPT[$i]}) "
+     [ -d "${JOB_CWD[$i]}" ] || miss+="${JOB_NAME[$i]}:cwd(${JOB_CWD[$i]}) "
+   done
+@@ -851,9 +1335,20 @@
+   fi
+   KEEPER_FAMILY="$v"; printf '%s' "$v"
+ }
++# spawn_generation_bind IDX PID TOKEN —— keeper 亲启世代的机器指纹 + 子进程登记
++#   · gen/<job>.rec 是"这个进程由 keeper 拉起"的唯一凭据（c1 冒充防护的锚点）；
++#   · CHILD_OWNED 用于后续 `wait` 取真实退出码（作业是 keeper 的直接子进程；setsid 不 fork）。
++spawn_generation_bind() {
++  local i="$1" p="$2" tok="${3:-}"
++  gen_rec_write "$i" "$p" "$tok"
++  if [ -n "${SPAWN_CHILD_PID:-}" ] && [ "$SPAWN_CHILD_PID" = "$p" ]; then
++    CHILD_OWNED["$p"]=1
++  fi
++  return 0
++}
+ spawn_job() { # IDX → 0=成功(SPAWN_PID)；2=dry-run；1/3=失败
+   local i="$1" exe script cwd out pf tok
+-  SPAWN_WHY=""; SPAWN_PID=""; SPAWN_CHILD_PID=""; SPAWN_TRUST=""
++  SPAWN_WHY=""; SPAWN_PID=""; SPAWN_CHILD_PID=""; SPAWN_TRUST=""; SPAWN_TOKEN=""
+   script="${JOB_SCRIPT[$i]}"; cwd="${JOB_CWD[$i]}"; out="${JOB_OUTLOG[$i]}"
+   pf="${JOB_PIDFILE[$i]}"; exe="$(job_exec_of "$i")"
+   [ -f "$script" ] || { SPAWN_WHY="script_not_visible($script)"; return 1; }
+@@ -866,6 +1361,7 @@
+   [ "$KEEPER_SETSID" = 1 ] || launcher=""
+   [ -n "$KEEPER_FAMILY" ] || keeper_family >/dev/null
+   tok="kv3:$KEEPER_FAMILY:${JOB_NAME[$i]}:${RANDOM}${RANDOM}"
++  SPAWN_TOKEN="$tok"
+   # shellcheck disable=SC2086
+   (
+     cd "$cwd" || exit 1
+@@ -879,12 +1375,15 @@
+   SPAWN_CHILD_PID=$!
+   local waited=0 p
+   while [ "$waited" -lt $((KEEPER_SPAWN_VERIFY_S * 4)) ]; do
+-    sleep 0.25; waited=$((waited+1))
++    sleep 0.25 9>&-            # v3.1 K-2：spawn 核对轮询不继承单例锁 fd
++    waited=$((waited+1))
+     if [ "$STOP_REQUESTED" = 1 ]; then SPAWN_WHY="stop_requested_during_spawn"; return 3; fi
+     if pidfile_read "$i"; then
+       p="$PF_PID"
+       if verify_pid_for_job "$i" "$p"; then
+-        SPAWN_PID="$p"; SPAWN_TRUST="$VERIFY_TRUST"; SPAWN_WHY=""; return 0
++        SPAWN_PID="$p"; SPAWN_TRUST="$VERIFY_TRUST"; SPAWN_WHY=""
++        spawn_generation_bind "$i" "$p" "$tok"
++        return 0
+       fi
+     fi
+   done
+@@ -896,6 +1395,7 @@
+   if [ "$scnt" -eq 1 ] && [ -n "$scpid" ]; then
+     SPAWN_PID="$scpid"; SPAWN_TRUST="scan_fallback"
+     SPAWN_WHY="pidfile_missing_after_spawn(pf_raw=${PF_RAW:0:60})"
++    spawn_generation_bind "$i" "$scpid" "$tok"
+     return 0
+   fi
+   SPAWN_WHY="spawn_unverified(pf_raw=${PF_RAW:0:80} last_verify=${VERIFY_WHY:-none} proc_exists=$([ -n "${PF_PID:-}" ] && proc_exists "$PF_PID" && printf yes || printf no))"
+@@ -919,15 +1419,29 @@
+     local key_state="last_state_${JOB_NAME[$i]}" key_restarts="restarts_${JOB_NAME[$i]}"
+     local key_trust="last_trust_${JOB_NAME[$i]}"      # v3：身份信任等级（token/legacy…）
+ 
+-    # ---------- 1) 守卫：完成标记 ----------
+-    if job_complete "$i"; then
++    # ---------- 0) [J] 终态守卫（机器化 F6；grep 仅作可选兼容降级通道） ----------
++    # 已收敛（exit 0 / decided=done / 终态记录）或已停机（halt）⇒ 不再重启、不再巡检重启。
++    if job_settled "$i"; then
++      local settled_state; settled_state="$(job_settled_state "$i")"
++      if [ "$(st_get "$key_state")" != "$settled_state" ]; then
++        detect_job "$i"
++        audit guard_suppressed "" "${DET_PID:--}" \
++          "$(evcat "$(ev reason=terminal_final action=no_restart source="$TERM_SOURCE" verdict="${TERM_VERDICT:-none}" exit_code="${TERM_EXIT:--1}" settled_state="$settled_state" halt_reason="$(st_get "halt_reason_${JOB_NAME[$i]}")" evidence_level="$([ "$TERM_SOURCE" = compat_grep ] && printf low || printf high)" note="机器终态判据命中（KEEPER_COMPAT_GREP=${KEEPER_COMPAT_GREP}；grep 标记默认不作为主判据）")" "$(comp_evidence "$i")")"
++        [ "$settled_state" = halted ] && st_set "last_state_${JOB_NAME[$i]}" halted
++      fi
++      st_set "$key_state" "$settled_state"
++      continue
++    fi
++
++    # ---------- 1) 守卫：兼容降级通道（grep 完成标记；仅 KEEPER_COMPAT_GREP=1 时可达） ----------
++    if [ "$KEEPER_COMPAT_GREP" = 1 ] && job_complete "$i"; then
+       detect_job "$i"
+       if [ "$DET_STATE" = "running" ]; then
+         audit guard_suppressed "" "$DET_PID" \
+-          "$(evcat "$(ev reason=completed action=no_restart)" "$(comp_evidence "$i")" "$(ev still_running_pid="$DET_PID")")"
++          "$(evcat "$(ev reason=completed action=no_restart channel=compat_grep evidence_level=low)" "$(comp_evidence "$i")" "$(ev still_running_pid="$DET_PID")")"
+       else
+         audit guard_suppressed "" - \
+-          "$(evcat "$(ev reason=completed action=no_restart)" "$(comp_evidence "$i")")"
++          "$(evcat "$(ev reason=completed action=no_restart channel=compat_grep evidence_level=low)" "$(comp_evidence "$i")")"
+       fi
+       st_set "$key_state" completed
+       continue
+@@ -942,14 +1456,19 @@
+         if [ "$(st_get "$key_state")" != "running" ] || [ "$(st_get "$key_pid")" != "$DET_PID" ] \
+            || [ "$DET_WHY" != "pidfile_verified" ]; then
+           case "$DET_WHY" in
+-            adopt_scan|adopt_token|adopt_legacy_loose|pidfile_token_verified_starttime_refresh|pidfile_token_verified_starttime_repaired)
++            adopt_scan|adopt_token|adopt_generation|adopt_legacy_loose|pidfile_token_verified_starttime_refresh|pidfile_token_verified_starttime_repaired)
+               pidfile_write "$i" "$DET_PID" adopted=1 "trust=${DET_TRUST:-legacy}"
+               audit adopt "$DET_PID" "$DET_PID" \
+                 "$(evcat "$(ev reason="$DET_WHY" action=write_pidfile trust="${DET_TRUST:-legacy}" starttime="$(proc_starttime "$DET_PID" 2>/dev/null)")" "$DET_EV")"
+               # 无环境指纹 token 的认领：**必须显式出证**（R1 crit 建议 3：绝不静默 running）
++              # v3.1：即便 token 命中，只要没有 keeper 亲启世代记录支撑，同样显式出证
++              # （token 单证不得静默通过；c1 冒充防护）
+               if [ "${DET_TRUST:-}" != token ] && [ -n "${DET_TRUST:-}" ]; then
+                 audit adopt_unverified "$DET_PID" "$DET_PID" \
+-                  "$(evcat "$(ev candidate_pid="$DET_PID" trust="$DET_TRUST" source="${DET_WHY}" action=adopt_with_flag note="无环境指纹 token：按 legacy 通道认领，已标注不可验证；仅当 token/路径+exe+cwd 证据充分时才走到这里")" "$DET_EV")"
++                  "$(evcat "$(ev candidate_pid="$DET_PID" trust="$DET_TRUST" source="${DET_WHY}" action=adopt_with_flag note="无环境指纹 token：按 legacy/世代通道认领，已标注不可验证；仅当 token/路径+exe+cwd 证据充分时才走到这里")" "$DET_EV")"
++              elif [ "$DET_WHY" = adopt_token ] && [ "$KEEPER_GEN_BIND" = 1 ]; then
++                gen_rec_read "$i" || audit adopt_unverified "$DET_PID" "$DET_PID" \
++                  "$(evcat "$(ev candidate_pid="$DET_PID" trust=token source="${DET_WHY}" reason=token_without_generation_record action=adopt_with_flag evidence_level=low note="token 单证（无 keeper 亲启世代记录可交叉验证）：认领但显式标注不可验证，绝不静默")" "$DET_EV")"
+               fi ;;
+             *)
+               audit process_alive "$DET_PID" "$DET_PID" "$DET_EV" ;;
+@@ -983,9 +1502,48 @@
+         from_pid="$(st_get "$key_pid")"
+         dead_pid="$from_pid"; [ "$dead_pid" = "0" ] && dead_pid=""
+         dead_ev="$DET_EV"
++        # v3.1 [K]：被拒认领的陌生候选记入状态文件（c1 冒充防护的可观测面；
++        # 拒绝事件本身由 refuse_adopt 写入 keeper_adopt_refused 审计）
++        if [ "${DET_REFUSED_N:-0}" != 0 ]; then
++          st_set "refused_${JOB_NAME[$i]}" "$DET_REFUSED_JSON"
++          st_set "refused_count_${JOB_NAME[$i]}" "$(( $(st_get "refused_count_${JOB_NAME[$i]}") + DET_REFUSED_N ))"
++        fi
++        # ---------- 2b) [J] 机器化终态判据：exit code + 结构化报告（F6 闭环） ----------
++        local v_kind="" v_reason="${DET_WHY}"
++        if [ "$KEEPER_MACHINE_VERDICT" = 1 ]; then
++          job_verdict_compute "$i"
++          # 世代记录里的 pid 才是"我们的作业"；DET_PID 可能是扫描到的别的进程
++          [ -n "${GEN_PID:-}" ] && [ "${DET_PID:-}" != "${GEN_PID}" ] && [ -z "$dead_pid" ] && dead_pid="$GEN_PID"
++          audit keeper_exit_observed "$dead_pid" "$dead_pid" \
++            "$(evcat "$(ev job="${JOB_NAME[$i]}" verdict="$V_VERDICT" exit_code="${V_EXIT:--1}" decided="${V_DECIDED:-none}" source="$V_SOURCE" channel_conflict="$V_CONFLICT" gen_pid="${GEN_PID:-0}" gen_present="$GEN_PRESENT" gen_starttime="${GEN_START:-?}" detector_why="$DET_WHY" action="$([ "$V_VERDICT" = converged ] && printf stop || printf evaluate_matrix)")" \
++            "$(ev report="${CONV_PATH:-none}" report_stale="$CONV_STALE" report_decided="${CONV_DECIDED:-none}")")" \
++            process "$(ev job="${JOB_NAME[$i]}" verdict="$V_VERDICT" exit_code="${V_EXIT:--1}" source="$V_SOURCE")"
++          [ "$V_CONFLICT" = 1 ] && audit keeper_terminal_channel_conflict "$dead_pid" - \
++            "$(ev job="${JOB_NAME[$i]}" wait_exit="${V_EXIT:--1}" report_exit="${CONV_EXIT:-none}" report_decided="${CONV_DECIDED:-none}" action=prefer_report_terminal note="OS 退出码与结构化终态不一致：以 converge 自己的终态报告为收敛结论，同时保留冲突证据")"
++          case "$V_VERDICT" in
++            converged)
++              job_stop_converged "$i" "${V_EXIT:-0}" "$V_SOURCE" "$V_DECIDED"
++              continue ;;
++            incomplete)
++              job_limited_restart "$i" "$dead_pid" exit3 "${V_EXIT:-3}" "$V_DECIDED" || true
++              continue ;;
++            stall_stop)
++              job_limited_restart "$i" "$dead_pid" exit4 "${V_EXIT:-4}" "$V_DECIDED" || true
++              continue ;;
++            *) v_kind="$V_VERDICT" ;;   # crash / signal / unknown ⇒ 既有崩溃路径 + 预算
++          esac
++        fi
+         # 退避（崩溃循环保护，上限被夹在 DEADLINE 之内）
+         local fail backoff_ms waited
+         fail="$(st_get "$key_fail")"
++        # ---------- 2c) 重启预算（supervisord startretries 式）：超限 ⇒ 停机告警，不再重启 ----------
++        if [ "$KEEPER_HALT_ON_FLAP" = 1 ] && [ "$fail" -ge "$KEEPER_START_RETRIES" ] 2>/dev/null; then
++          audit keeper_restart_budget_exhausted "$dead_pid" - \
++            "$(evcat "$(ev job="${JOB_NAME[$i]}" kind=rapid_death attempts="$fail" limit="$KEEPER_START_RETRIES" verdict="${v_kind:-crash}" action=halt note="连续快速失败超限：停止重启并升级告警（v3.0 的 FLAP 只审计不停止）")" "$dead_ev")" \
++            process "$(ev job="${JOB_NAME[$i]}" kind=rapid_death attempts="$fail" limit="$KEEPER_START_RETRIES")"
++          job_halt "$i" "restart_budget_exhausted" "rapid_deaths=$fail/$KEEPER_START_RETRIES verdict=${v_kind:-crash}" "$dead_pid"
++          continue
++        fi
+         backoff_ms=0
+         if [ "$fail" -gt 0 ]; then
+           backoff_ms=$(( KEEPER_TICK * 1000 ))
+@@ -1017,8 +1575,8 @@
+           st_set "$key_spawn" "$t1"; st_set "$key_pid" "$SPAWN_PID"; st_set "$key_alive" "$t1"
+           st_set "$key_state" running
+           audit restart "$dead_pid" "$SPAWN_PID" \
+-            "$(evcat "$(ev reason="${DET_WHY}" script="${JOB_SCRIPT[$i]}" cwd="${JOB_CWD[$i]}" spawn_verify_ms="$alive_ms" starttime="$(proc_starttime "$SPAWN_PID" 2>/dev/null)" total_restarts="$(st_get "$key_restarts")" deadline_ms=$((KEEPER_RECOVERY_DEADLINE*1000)) spawn_trust="${SPAWN_TRUST:-unknown}" spawn_child_pid="${SPAWN_CHILD_PID:-0}")" "$(ev detection="$dead_ev")")" \
+-            process "$(ev from_pid="${dead_pid:-0}" to_pid="$SPAWN_PID" reason="${DET_WHY}" recovery_ms="$alive_ms" ticks_note="deadline=${KEEPER_RECOVERY_DEADLINE}s" evidence="$(evcat "$(ev detection="$dead_ev")")")"
++            "$(evcat "$(ev reason="${DET_WHY}" script="${JOB_SCRIPT[$i]}" cwd="${JOB_CWD[$i]}" spawn_verify_ms="$alive_ms" starttime="$(proc_starttime "$SPAWN_PID" 2>/dev/null)" total_restarts="$(st_get "$key_restarts")" deadline_ms=$((KEEPER_RECOVERY_DEADLINE*1000)) spawn_trust="${SPAWN_TRUST:-unknown}" spawn_child_pid="${SPAWN_CHILD_PID:-0}" verdict="${v_kind:-unknown}" exit_code="${V_EXIT:--1}" verdict_source="${V_SOURCE:-none}" restart_kind="crash_path" fail_count="$(st_get "$key_fail")")" "$(ev detection="$dead_ev")")" \
++            process "$(ev from_pid="${dead_pid:-0}" to_pid="$SPAWN_PID" reason="${DET_WHY}" recovery_ms="$alive_ms" ticks_note="deadline=${KEEPER_RECOVERY_DEADLINE}s" verdict="${v_kind:-unknown}" exit_code="${V_EXIT:--1}" evidence="$(evcat "$(ev detection="$dead_ev")")")"
+           CYCLE_SPAWNS=$((CYCLE_SPAWNS+1))
+           # 拉起后立刻做一次心跳分类（否则要等下一轮才知道是否处于退避/闸门冻结）
+           heartbeat_cycle "$i" "$SPAWN_PID" "${SPAWN_TRUST:-unknown}"
+@@ -1027,7 +1585,7 @@
+           fi
+           if [ "$(st_get "$key_fail")" -ge "$KEEPER_FLAP_THRESHOLD" ]; then
+             audit restart_flapping "" "$SPAWN_PID" \
+-              "$(ev consecutive_rapid_deaths="$(st_get "$key_fail")" restart_count="$(st_get "$key_restarts")" note="进程反复秒死，请人工检查运行环境/依赖")"
++              "$(ev consecutive_rapid_deaths="$(st_get "$key_fail")" restart_count="$(st_get "$key_restarts")" halt_threshold="$KEEPER_START_RETRIES" halt_on_flap="$KEEPER_HALT_ON_FLAP" note="进程反复秒死（告警档）；再连续失败至 $KEEPER_START_RETRIES 次将停止重启并停机告警（KEEPER_HALT_ON_FLAP=1）")"
+           fi
+         elif [ "$rc" = 2 ]; then
+           st_set "$key_state" dry_run
+@@ -1083,6 +1641,21 @@
+     audit config_warning "" - "$(ev reason=max_backoff_exceeds_deadline old_max_backoff="$KEEPER_MAX_BACKOFF" clamped_to="$clamped" deadline="$KEEPER_RECOVERY_DEADLINE")"
+     KEEPER_MAX_BACKOFF="$clamped"
+   fi
++  # v3.1 [J]：绝不允许"零完成判据"运行（机器判据关 + 兼容 grep 关 ⇒ 作业永不休止）
++  if [ "$KEEPER_MACHINE_VERDICT" != 1 ] && [ "$KEEPER_COMPAT_GREP" != 1 ]; then
++    audit config_warning "" - \
++      "$(ev reason=no_completion_criterion machine_verdict="$KEEPER_MACHINE_VERDICT" compat_grep="$KEEPER_COMPAT_GREP" action=force_compat_grep note="机器终态判据与兼容降级判据同时关闭 ⇒ 强制启用 grep 兼容通道（fail-safe：不允许无完成判据的看护）")"
++    KEEPER_COMPAT_GREP=1
++  fi
++  # v3.1 [L]/K-6：停止标志的清理提前到抢锁之前（v3.0 在抢锁/状态/审计之后 ⇒ 启动窗口内的
++  # stop 请求会被删除并吞掉）
++  local stop_flag="$KEEPER_STATE_DIR/keeper-v3.stop"
++  if [ -f "$stop_flag" ]; then
++    hlog "启动前发现停止标志（启动窗口内的 stop 请求）：立即优雅收尾，不进入看护循环"
++    rm -f "$stop_flag" 2>/dev/null
++    audit keeper_exit "" - "$(ev code=0 reason=stop_flag_at_startup note="启动窗口内收到 stop：按请求退出，不吞掉停止意图")"
++    return 0
++  fi
+   # v3 [E]：先抢单例锁再干任何事（state/pid 文件/审计都由在位 keeper 独占写）
+   if [ "$KEEPER_SINGLETON" = 1 ]; then
+     singleton_acquire || return $?
+@@ -1099,12 +1672,17 @@
+   hlog "keeper-v3 启动 pid=$$ run_id=$RUN_ID family=$KEEPER_FAMILY jobs=$(job_count) tick=${KEEPER_TICK}s singleton=$KEEPER_SINGLETON"
+   local last_hb last_env now
+   last_hb="$(now_ms)"; last_env="$(now_ms)"
+-  local stop_flag="$KEEPER_STATE_DIR/keeper-v3.stop"
+-  rm -f "$stop_flag" 2>/dev/null
+   # v3 [F]：信号 ⇒ 优雅收尾（停重启循环 + 排空自建子进程 + checkpoint + 审计）
+   trap 'on_signal TERM' TERM
+   trap 'on_signal INT' INT
+   while :; do
++    # v3.1 [L]/K-1：每轮校验锁文件 inode（锁被删/重建 ⇒ 重新抢锁，抢不到则让位退出 6）
++    if ! singleton_check_inode; then
++      CUR_JOB="-"
++      audit keeper_exit "" - "$(ev code=6 reason=singleton_yield_lock_replaced note="锁文件被删/重建且新 inode 已被他人持有：让位退出，绝不双活（K-1 分裂脑防线）")"
++      hlog "keeper-v3 让位退出（rc=6）：锁文件被重建且新持有者已就位"
++      return 6
++    fi
+     cycle
+     now="$(now_ms)"
+     if [ $(( now - last_hb )) -ge $((KEEPER_HEARTBEAT*1000)) ]; then
+@@ -1120,6 +1698,7 @@
+       CUR_JOB="-"
+       audit keeper_signal "" - "$(ev signal="$STOP_SIGNAL" action=graceful_stop)"
+       graceful_stop "$STOP_SIGNAL" "signal_$STOP_SIGNAL"
++      audit keeper_exit "" - "$(ev code=0 reason=signal_$STOP_SIGNAL run_count="$(st_get run_count)" uptime_ms="$(( now - $(st_get first_ms) ))")"
+       hlog "keeper-v3 停止（SIG$STOP_SIGNAL 优雅收尾）"
+       return 0
+     fi
+@@ -1128,10 +1707,11 @@
+       if [ -f "$stop_flag" ]; then
+         CUR_JOB="-"
+         graceful_stop "stop_flag" "stop_flag"
++        audit keeper_exit "" - "$(ev code=0 reason=stop_flag run_count="$(st_get run_count)")"
+         hlog "keeper-v3 停止（stop 标志）"; rm -f "$stop_flag" 2>/dev/null; return 0
+       fi
+       if [ "$STOP_REQUESTED" = 1 ]; then break; fi
+-      sleep 1
++      sleep 1 9>&-          # v3.1 K-2：tick 内的 sleep 不继承单例锁 fd 9
+     done
+   done
+ }
+@@ -1156,7 +1736,14 @@
+   for ((i=0; i<${#JOB_NAME[@]}; i++)); do
+     CUR_JOB="${JOB_NAME[$i]}"
+     detect_job "$i"
+-    sum+="$sep$(ev job="${JOB_NAME[$i]}" state="$DET_STATE" pid="${DET_PID:-0}" why="$DET_WHY" trust="${DET_TRUST:-none}" hb_class="$(st_get hb_class_${JOB_NAME[$i]})" hb_stall_streak="$(st_get hb_stall_streak_${JOB_NAME[$i]})" complete="$(job_complete "$i" && printf yes || printf no)" restarts="$(st_get restarts_${JOB_NAME[$i]})")"
++    local settled=no sverdict=none ssource=none
++    if job_settled "$i"; then settled=yes; sverdict="${TERM_VERDICT:-none}"; ssource="${TERM_SOURCE:-none}"; fi
++    gen_rec_read "$i" || true
++    local gmatch=none
++    if [ -n "$DET_PID" ] && [ "$GEN_PRESENT" = 1 ]; then
++      gmatch="$(gen_match "$i" "$DET_PID" "$(proc_starttime "$DET_PID" 2>/dev/null || printf '?')" "$(tok_hash "$IDF_TOKEN_RAW")")"
++    elif [ "$GEN_PRESENT" = 1 ]; then gmatch=stale; fi
++    sum+="$sep$(ev job="${JOB_NAME[$i]}" state="$DET_STATE" pid="${DET_PID:-0}" why="$DET_WHY" trust="${DET_TRUST:-none}" hb_class="$(st_get hb_class_${JOB_NAME[$i]})" hb_stall_streak="$(st_get hb_stall_streak_${JOB_NAME[$i]})" complete="$(job_complete "$i" && printf yes || printf no)" restarts="$(st_get restarts_${JOB_NAME[$i]})" settled="$settled" settled_verdict="$sverdict" settled_source="$ssource" exit_code="$(st_get exit_code_${JOB_NAME[$i]})" halted="$(st_get halted_${JOB_NAME[$i]})" halt_reason="$(st_get halt_reason_${JOB_NAME[$i]})" incomplete_restarts="$(st_get incomplete_restarts_${JOB_NAME[$i]})" resume_restarts="$(st_get resume_restarts_${JOB_NAME[$i]})" fail_count="$(st_get fail_${JOB_NAME[$i]})" gen_present="$GEN_PRESENT" gen_pid="${GEN_PID:-0}" gen_match="$gmatch" refused_count="$(st_get refused_count_${JOB_NAME[$i]})")"
+     sep=','
+   done
+   sum+=']'; CUR_JOB="-"
+@@ -1169,19 +1756,51 @@
+   printf '%-10s %-9s %-10s %-8s %-10s %-22s %-16s %s\n' JOB COMPLETED STATE PID TRUST PID_SRC HB_CLASS EVIDENCE
+   local i
+   for ((i=0; i<${#JOB_NAME[@]}; i++)); do
+-    local completed=no; job_complete "$i" && completed=yes
++    local completed=no; job_settled "$i" && completed=yes
+     detect_job "$i"
+     hb_classify_file "$(hb_path_of "$i")"
+     printf '%-10s %-9s %-10s %-8s %-10s %-22s %-16s %s\n' \
+       "${JOB_NAME[$i]}" "$completed" "$DET_STATE" "${DET_PID:- -}" "${DET_TRUST:-none}" "$DET_WHY" "$HB_CLASS" "$(printf '%s' "$DET_EV" | cut -c1-90)"
++    # v3.1 [J]：机器化终态面（退出码判据 / 停机告警 / 重启预算）
++    if [ "$completed" = yes ]; then
++      printf '           terminal: verdict=%s settled_source=%s exit_code=%s decided=%s\n' \
++        "${TERM_VERDICT:-none}" "${TERM_SOURCE:-none}" "$(st_get "exit_code_${JOB_NAME[$i]}")" "${TERM_DECIDED:-none}"
++    fi
++    if [ "$(st_get "halted_${JOB_NAME[$i]}")" = 1 ]; then
++      printf '           HALTED: reason=%s fail_count=%s incomplete_restarts=%s resume: keeper-v3.sh resume %s\n' \
++        "$(st_get "halt_reason_${JOB_NAME[$i]}")" "$(st_get "fail_${JOB_NAME[$i]}")" \
++        "$(st_get "incomplete_restarts_${JOB_NAME[$i]}")" "${JOB_NAME[$i]}"
++    fi
++    if [ "$(st_get "refused_count_${JOB_NAME[$i]}")" != "" ] && [ "$(st_get "refused_count_${JOB_NAME[$i]}")" != 0 ]; then
++      printf '           adopt_refused: count=%s last=%s\n' "$(st_get "refused_count_${JOB_NAME[$i]}")" "$(st_get "refused_${JOB_NAME[$i]}" | cut -c1-140)"
++    fi
+   done
+   printf '\nTRUST=none ⇒ 身份不可验证（R1 crit S1/S2 的冒充者通道已被拒绝认领）；legacy ⇒ 无 token 的老进程\n'
++  printf '判据：KEEPER_MACHINE_VERDICT=%s（exit code + 结构化终态）KEEPER_COMPAT_GREP=%s（grep 兼容降级通道）KEEPER_GEN_BIND=%s（世代绑定认领）\n' \
++    "$KEEPER_MACHINE_VERDICT" "$KEEPER_COMPAT_GREP" "$KEEPER_GEN_BIND"
+   local kp="$KEEPER_STATE_DIR/keeper-v3.pid"
+   if [ -r "$kp" ]; then
+     printf '\nkeeper 自身 PID 文件: %s\n' "$(head -c 200 "$kp")"
+-    local kpid; kpid="$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$kp")"
++    # v3.1 [L]/K-5：存活判定必须同时核对 starttime 与 cmdline（防 PID 复用误报"keeper 存活"）
++    local kpid kst now_st verd
++    kpid="$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$kp")"
++    kst="$(sed -n 's/.*starttime=\([0-9]*\).*/\1/p' "$kp")"
+     if [ -n "$kpid" ] && [ -d "/proc/$kpid" ]; then
+-      printf 'keeper 存活: yes (pid=%s cmdline=%s)\n' "$kpid" "$(proc_cmdline_text "$kpid")"
++      now_st="$(proc_starttime "$kpid" 2>/dev/null || printf '?')"
++      if [ -n "$kst" ] && [ "$now_st" != "$kst" ]; then
++        verd="no_pid_reuse"
++        printf 'keeper 存活: NO（pid=%s 存在但 starttime 不符：pidfile=%s /proc=%s ⇒ PID 复用，非本 keeper）\n' "$kpid" "$kst" "$now_st"
++      else
++        case "$(proc_cmdline_text "$kpid")" in
++          *keeper-v3.sh*) verd=yes ;;
++          *) verd="no_cmdline" ;;
++        esac
++        if [ "$verd" = yes ]; then
++          printf 'keeper 存活: yes (pid=%s starttime=%s 核对通过 cmdline=%s)\n' "$kpid" "${now_st:-?}" "$(proc_cmdline_text "$kpid" | cut -c1-80)"
++        else
++          printf 'keeper 存活: NO（pid=%s starttime 相符但 cmdline 不含 keeper-v3.sh：%s）\n' "$kpid" "$(proc_cmdline_text "$kpid" | cut -c1-80)"
++        fi
++      fi
+     else
+       printf 'keeper 存活: no\n'
+     fi
+@@ -1229,19 +1848,52 @@
+   for ((i=0; i<${#JOB_NAME[@]}; i++)); do [ "${JOB_NAME[$i]}" = "$want" ] && found=$i; done
+   if [ "$found" -lt 0 ]; then printf '未知作业: %s（可用: %s）\n' "$want" "$(printf '%s ' ${JOB_NAME[@]+"${JOB_NAME[@]}"})" >&2; return 2; fi
+   state_load
++  # v3.1 (K-6)：spawn 是唯一的"写 pidfile 特权动作"，在位 keeper 存在时默认拒绝
++  # （避免两实例同时巡检/拉起/写 pidfile）；演练需要时用 KEEPER_ALLOW_SPAWN_WITH_KEEPER=1 放行。
++  local pout prc=0
++  pout="$(singleton_probe)"; prc=$?
++  if [ "$prc" = 1 ] && [ "${KEEPER_ALLOW_SPAWN_WITH_KEEPER:-0}" != 1 ]; then
++    audit spawn_refused "" - \
++      "$(ev job="$want" self_pid="$$" probe="$pout" action=refuse_spawn allow_env=KEEPER_ALLOW_SPAWN_WITH_KEEPER note="探测到在位 keeper：spawn 会绕过单例锁并可能双写 pidfile（K-6）⇒ 默认拒绝")"
++    printf 'SPAWN_RC=4 pid=none trust=none why=in_position_keeper(%s)\n' "$pout"
++    return 4
++  fi
+   keeper_family >/dev/null
+   spawn_job "$found"; rc=$?
+   printf 'SPAWN_RC=%s pid=%s trust=%s why=%s\n' "$rc" "${SPAWN_PID:-none}" "${SPAWN_TRUST:-none}" "${SPAWN_WHY:-none}"
+   if [ "$rc" = 0 ]; then pidfile_write "$found" "$SPAWN_PID" spawned_by=keeper "trust=${SPAWN_TRUST:-spawned}"; fi
+   return $rc
+ }
++# cmd_resume JOB|all —— 解除机器判据造成的终态/停机（运维显式介入；写审计 + 清状态）
++cmd_resume() {
++  local want="${1:-}" i n=0
++  state_load
++  for ((i=0; i<${#JOB_NAME[@]}; i++)); do
++    [ -n "$want" ] && [ "$want" != all ] && [ "${JOB_NAME[$i]}" != "$want" ] && continue
++    local job="${JOB_NAME[$i]}"
++    local prev_term prev_halt rsn
++    prev_term="$(st_get "terminal_${job}")"; prev_halt="$(st_get "halted_${job}")"
++    rsn="$(st_get "halt_reason_${job}")"
++    st_set "terminal_${job}" ""; st_set "halted_${job}" 0; st_set "halt_reason_${job}" ""
++    st_set "fail_${job}" 0; st_set "incomplete_restarts_${job}" 0; st_set "resume_restarts_${job}" 0
++    st_set "exit_code_${job}" ""
++    rm -f "$(terminal_path "$i")" "$(halt_path "$i")" 2>/dev/null
++    audit keeper_job_resume "" - \
++      "$(ev job="$job" prev_terminal="${prev_term:-none}" prev_halted="${prev_halt:-0}" prev_halt_reason="${rsn:-none}" action=clear_terminal_and_budgets note="运维显式解除：清除终态记录与重启预算，下一轮巡检将按正常判据重新看护")"
++    printf 'resume: job=%s 已清除 terminal=%s halted=%s reason=%s\n' "$job" "${prev_term:-none}" "${prev_halt:-0}" "${rsn:-none}"
++    n=$((n+1))
++  done
++  state_save
++  [ "$n" -gt 0 ] || { printf '未匹配任何作业: %s（可用: %s）\n' "${want:-<空>}" "$(printf '%s ' ${JOB_NAME[@]+"${JOB_NAME[@]}"})" >&2; return 2; }
++  return 0
++}
+ cmd_daemon() {
+   local dlog="$KEEPER_STATE_DIR/keeper-v3.daemon.log"
+   mkdir -p "$KEEPER_STATE_DIR" 2>/dev/null
+   ( setsid nohup bash "$KEEPER_SELF" start </dev/null >>"$dlog" 2>&1 & ) 2>/dev/null \
+     || ( nohup bash "$KEEPER_SELF" start </dev/null >>"$dlog" 2>&1 & )
+   hlog "keeper-v3 daemon 已拉起（self pid 以 $KEEPER_STATE_DIR/keeper-v3.pid 为准；单例锁由 start 进程持有）"
+-  sleep 0.3
++  sleep 0.3 9>&-              # v3.1 K-2：TERM 宽限不继承单例锁 fd
+   singleton_probe >/dev/null 2>&1
+   return 0
+ }
+@@ -1423,13 +2075,94 @@
+   fi
+ 
+   # ================= v3 新增用例（[G] 认领 / [I] 挡板 / [E] 单例 / [H] 心跳） =====
+-  printf -- '-- case 12: 环境指纹 token 身份 ⇒ 认领为 token 级（最强证据） --\n'
++  # ---- v3.1 重写 case 12（世代绑定）：旧断言"token 单证即认领"正是 c1 冒充者通道 ----
++  printf -- '-- case 12: 世代绑定——keeper 亲启 + token ⇒ 认领；偷 token 的陌生进程 ⇒ 拒绝 --\n'
++  rm -f "$pf"
++  # 12a：keeper 亲启的进程（spawn_job 写 gen/<job>.rec）⇒ 即使删掉 pidfile 也应认领
++  : >"$D/out.log"
++  KEEPER_SETSID=1 KEEPER_DRY_RUN=0 spawn_job 0; local rc12=$?
++  local gp="${SPAWN_PID:-}"
++  if [ "$rc12" = 0 ] && [ -n "$gp" ] && [ -d "/proc/$gp" ]; then
++    rm -f "$pf"
++    detect_job 0
++    { [ "$DET_STATE" = running ] && [ "$DET_PID" = "$gp" ] && [ "$DET_WHY" = adopt_token ] && [ "$DET_TRUST" = token ]; } \
++      && _st_case "identity_generation_bound_adopt" 1 "keeper 亲启世代 pid=$gp ⇒ state=$DET_STATE why=$DET_WHY trust=$DET_TRUST（token 哈希 + pid/starttime 与 gen 记录逐字相符）" \
++      || _st_case "identity_generation_bound_adopt" 0 "state=$DET_STATE pid=${DET_PID:-} why=$DET_WHY trust=${DET_TRUST:-}"
++  else
++    _st_case "identity_generation_bound_adopt" 0 "spawn_job 未成功（rc=$rc12 pid=$gp）⇒ 无法验证"
++  fi
++  # 12a2：无 token 的 keeper 亲启进程（TOKEN_ENFORCE=0）⇒ 世代记录单独支撑认领（adopt_generation）
++  _st_kill_local "$gp" 2>/dev/null; sleep 0.3; rm -f "$pf"
++  local tok_keep="$KEEPER_TOKEN_ENFORCE"; KEEPER_TOKEN_ENFORCE=0
++  KEEPER_SETSID=1 KEEPER_DRY_RUN=0 spawn_job 0; local rc12b=$?; KEEPER_TOKEN_ENFORCE="$tok_keep"
++  local gp2="${SPAWN_PID:-}"
++  if [ "$rc12b" = 0 ] && [ -n "$gp2" ] && [ -d "/proc/$gp2" ]; then
++    rm -f "$pf"; detect_job 0
++    { [ "$DET_STATE" = running ] && [ "$DET_PID" = "$gp2" ] && [ "$DET_WHY" = adopt_generation ]; } \
++      && _st_case "identity_generation_without_token" 1 "无 token 但世代相符 ⇒ why=$DET_WHY trust=$DET_TRUST pid=$gp2（世代记录本身即是认领凭据）" \
++      || _st_case "identity_generation_without_token" 0 "state=$DET_STATE pid=${DET_PID:-} why=$DET_WHY trust=${DET_TRUST:-}"
++  else
++    _st_case "identity_generation_without_token" 0 "spawn_job 未成功（rc=$rc12b pid=$gp2）"
++  fi
++  _st_kill_local "$gp2" 2>/dev/null; sleep 0.3; rm -f "$pf"; rm -f "$(gen_rec_path 0)" 2>/dev/null
++  # 12b：偷 token 的陌生进程（argv/cwd/exe 逐轴复刻 + token 逐字复制）⇒ 必须被拒；
++  #      与此同时真作业（keeper 亲启世代）仍被认领 —— c1a 攻击的直接反转
++  rm -f "$pf"; : >"$D/out.log"
++  KEEPER_SETSID=1 KEEPER_DRY_RUN=0 spawn_job 0; local rc12c=$?
++  local real="${SPAWN_PID:-}" before_refuse0 after_refuse0 ref0 stolen0
++  if [ "$rc12c" = 0 ] && [ -n "$real" ] && [ -d "/proc/$real" ]; then
++    stolen0="$(tr '\0' '\n' <"/proc/$real/environ" 2>/dev/null | sed -n 's/^SCRAPE_KEEPER_TOKEN=//p' | head -1)"
++    ( cd "$D" && SCRAPE_KEEPER_TOKEN="$stolen0" exec bash "$mock" ) </dev/null >>"$D/out.log" 2>&1 & local p3b=$!
++    sleep 0.5
++    # 复刻 c1a 攻击：伪造 pidfile 指向冒充者（pid+starttime 自洽，只有"世代"对不上）
++    printf 'pid=%s starttime=%s script=%s job=stj ts=%s forged_by=selftest\n' \
++      "$p3b" "$(proc_starttime "$p3b" 2>/dev/null || printf '?')" "$mock" "$(now_iso)" >"$pf"
++    before_refuse0="$(grep -c '"event":"keeper_adopt_refused"' "$KEEPER_AUDIT" 2>/dev/null)"; before_refuse0="${before_refuse0:-0}"
++    detect_job 0
++    after_refuse0="$(grep -c '"event":"keeper_adopt_refused"' "$KEEPER_AUDIT" 2>/dev/null)"; after_refuse0="${after_refuse0:-0}"
++    ref0="$(grep '"event":"keeper_adopt_refused"' "$KEEPER_AUDIT" 2>/dev/null | tail -1)"
++    local pf_after=""
++    local st_keep0; st_keep0="$(st_get "last_state_stj")"; st_set "last_state_stj" none
++    cycle >/dev/null 2>&1
++    st_set "last_state_stj" "$st_keep0"
++    pf_after="$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$pf" 2>/dev/null | head -1)"
++    { [ "$DET_PID" = "$real" ] && [ "$after_refuse0" -gt "$before_refuse0" ] \
++      && printf '%s' "$ref0" | grep -Eq 'stranger_token|stranger_candidate' \
++      && printf '%s' "$ref0" | grep -q "candidate_pid\":$p3b" \
++      && [ "$pf_after" = "$real" ]; } \
++      && _st_case "identity_stolen_token_stranger_refused" 1 "冒充者 pid=$p3b（token 逐字复制 ${stolen0:0:22}…、argv/cwd/exe 逐轴复刻）被拒：reason=$(printf '%s' "$ref0" | sed -n 's/.*"reason":"\([a-z_]*\)".*/\1/p' | head -1) gen_match=$(printf '%s' "$ref0" | sed -n 's/.*"gen_match":"\([a-z_]*\)".*/\1/p' | head -1)；真作业 pid=$real 仍被认领，pidfile→$pf_after（≠冒充者）" \
++      || _st_case "identity_stolen_token_stranger_refused" 0 "未达标：DET_PID=${DET_PID:-} real=$real impostor=$p3b refused_delta=$((after_refuse0-before_refuse0)) pidfile=$pf_after ref=$ref0"
++    _st_kill_local "$p3b" 2>/dev/null
++    _st_kill_local "$real" 2>/dev/null
++  else
++    _st_case "identity_stolen_token_stranger_refused" 0 "spawn_job 未成功（rc=$rc12c pid=$real）⇒ 无法验证"
++  fi
++  sleep 0.3; rm -f "$pf" "$(gen_rec_path 0)" 2>/dev/null
++  # 12c：无世代记录（state 被清/keeper 首次上任）+ token + 路径证据 ⇒ 认领但必须显式 adopt_unverified
++  rm -f "$(gen_rec_path 0)" 2>/dev/null
++  local before_uv; before_uv="$(grep -c '"event":"adopt_unverified"' "$KEEPER_AUDIT" 2>/dev/null)"; before_uv="${before_uv:-0}"
++  ( cd "$D" && SCRAPE_KEEPER_TOKEN="kv3:${KEEPER_FAMILY:-kfX}:stj:nogen" exec bash "$mock" ) </dev/null >>"$D/out.log" 2>&1 & local p3c=$!
++  sleep 0.4; rm -f "$pf"
++  detect_job 0
++  local uv_after; uv_after="$(grep -c '"event":"adopt_unverified"' "$KEEPER_AUDIT" 2>/dev/null)"; uv_after="${uv_after:-0}"
++  local cycle_ok=no
++  JOB_PIDFILE[0]="$pf"; detect_job 0 >/dev/null
++  # 走一遍认领分支（cycle 会写 pidfile + adopt_unverified）
++  local st_keep; st_keep="$(st_get "last_state_stj")"; st_set "last_state_stj" none
++  cycle >/dev/null 2>&1
++  st_set "last_state_stj" "$st_keep"
++  uv_after="$(grep -c '"event":"adopt_unverified"' "$KEEPER_AUDIT" 2>/dev/null)"; uv_after="${uv_after:-0}"
++  local uvline; uvline="$(grep '"event":"adopt_unverified"' "$KEEPER_AUDIT" 2>/dev/null | tail -1)"
++  { [ "$uv_after" -gt "$before_uv" ] && printf '%s' "$uvline" | grep -q 'token_without_generation_record'; } \
++    && _st_case "identity_token_without_generation_not_silent" 1 "token 单证（无世代记录）⇒ 认领但显式出证 adopt_unverified{reason=token_without_generation_record}（+$((uv_after-before_uv))）" \
++    || _st_case "identity_token_without_generation_not_silent" 0 "未出证（adopt_unverified $before_uv→$uv_after，末条=$uvline）"
++  _st_kill_local "$p3c"; sleep 0.3
+   rm -f "$pf"
+   ( cd "$D" && SCRAPE_KEEPER_TOKEN="kv3:${KEEPER_FAMILY:-kfX}:stj:nonce1" exec bash "$mock" ) </dev/null >>"$D/out.log" 2>&1 & p3=$!
+   sleep 0.4; detect_job 0
+-  { [ "$DET_STATE" = running ] && [ "$DET_PID" = "$p3" ] && [ "$DET_WHY" = adopt_token ] && [ "$DET_TRUST" = token ]; } \
+-    && _st_case "identity_token_adopt" 1 "state=$DET_STATE pid=$DET_PID why=$DET_WHY trust=$DET_TRUST" \
+-    || _st_case "identity_token_adopt" 0 "state=$DET_STATE pid=$DET_PID why=$DET_WHY trust=${DET_TRUST:-}"
++  { [ "$DET_STATE" = running ] && [ "$DET_PID" = "$p3" ] && [ "$DET_TRUST" = token ]; } \
++    && _st_case "identity_token_adopt" 1 "无世代记录时 token+路径 证据认领：state=$DET_STATE pid=$DET_PID why=$DET_WHY trust=$DET_TRUST（并已出 adopt_unverified）" \
++    || _st_case "identity_token_adopt" 0 "state=$DET_STATE pid=${DET_PID:-} why=$DET_WHY trust=${DET_TRUST:-}"
+ 
+   printf -- '-- case 13: token 存在但 job 字段不是本作业 ⇒ 拒绝认领（冒充者） --\n'
+   _st_kill_local "$p3"; sleep 0.4; rm -f "$pf"
+@@ -1563,45 +2296,182 @@
+ }
+ 
+ # =========================== v3 [E] 单例锁 / 停机标志 =========================
++# v3.1 [L] 加固：inode 校验（K-1 分裂脑）/ flock 失败原因区分 / fdinfo 交叉取证 /
++#            starttime 核对（K-5 PID 复用）。退出码：0=持有 / 4=冲突 / 5=锁不可用 / 6=让位。
+ SINGLETON_HELD=0; SINGLETON_HOLDER_PID=""; SINGLETON_HOLDER_RAW=""; SINGLETON_HOLDER_ALIVE=""
++SINGLETON_INODE=""; SINGLETON_LOCK_PATH=""; SINGLETON_HOLDER_VERIFIED=""
+ STOP_REQUESTED=0; STOP_SIGNAL=""
+ WAIT_CHILDREN_PENDING=0; WAIT_CHILDREN_WAITED=""
++lock_inode_of() { stat -Lc '%d:%i' "$1" 2>/dev/null; }
++# singleton_holders_scan LOCKFILE —— 用 /proc/<pid>/fdinfo 定位**真实**锁持有者
++#   （不信任落盘 holder 记录：crit-adversarial C2b 读到 15/24 错指认）
++#   输出每行：pid=<p> starttime=<st> fd=<n> cmd=<cmdline> lock=<fdinfo lock 行>
++singleton_holders_scan() {
++  local lf="$1" want d p fi fd fdino st n=0 lockline cmd kl
++  want="$(stat -Lc '%d:%i' "$lf" 2>/dev/null)"; [ -n "$want" ] || return 1
++  for d in /proc/[0-9]*; do
++    p="${d#/proc/}"
++    [ "$p" = "$$" ] && continue
++    [ -d "$d/fdinfo" ] || continue
++    for fi in "$d"/fdinfo/[0-9]*; do
++      [ -r "$fi" ] || continue
++      lockline="$(grep -m1 '^lock:' "$fi" 2>/dev/null)" || lockline=""
++      [ -n "$lockline" ] || continue
++      fd="${fi##*/}"
++      fdino="$(stat -Lc '%d:%i' "$d/fd/$fd" 2>/dev/null)" || continue
++      [ "$fdino" = "$want" ] || continue
++      st="$(proc_starttime "$p" 2>/dev/null || printf '?')"
++      cmd="$(proc_cmdline_text "$p" 2>/dev/null | cut -c1-60)"
++      kl=no; case "$cmd" in *keeper-v3.sh*) kl=yes ;; esac
++      printf 'pid=%s starttime=%s fd=%s keeper_like=%s cmd=%s lock=%s\n' "$p" "$st" "$fd" "$kl" "$cmd" \
++        "$(printf '%s' "$lockline" | tr -d '\n' | cut -c1-40)"
++      n=$((n+1))
++    done
++  done
++  [ "$n" -gt 0 ]
++}
++# singleton_primary_holder LOCKFILE —— 从 fdinfo 扫描结果里挑"最可能的真持有者"
++#   （优先 keeper_like=yes；纯 fd 继承的子进程排在后面 —— K-2 的 fd 泄漏会放大噪声）
++singleton_primary_holder() {
++  local lf="$1" lines best="" kl
++  lines="$(singleton_holders_scan "$lf" 2>/dev/null)" || { printf ''; return 1; }
++  best="$(printf '%s\n' "$lines" | grep -m1 'keeper_like=yes')"
++  [ -n "$best" ] || best="$(printf '%s\n' "$lines" | head -1)"
++  printf '%s' "$best"
++}
+ singleton_holder_write() {
+   local f="$KEEPER_HOLDER_FILE" tmp="$KEEPER_HOLDER_FILE.tmp.$$"
+   mkdir -p "$(dirname "$f")" 2>/dev/null
+-  printf 'pid=%s starttime=%s run_id=%s keeper=%s script=%s ts=%s\n' \
++  printf 'pid=%s starttime=%s run_id=%s keeper=%s script=%s lock_file=%s lock_inode=%s ts=%s\n' \
+     "$$" "$(proc_starttime $$ 2>/dev/null || printf '?')" "$RUN_ID" "$KEEPER_VERSION" \
+-    "$KEEPER_SELF" "$(now_iso)" >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
++    "$KEEPER_SELF" "${SINGLETON_LOCK_PATH:-$KEEPER_LOCK_FILE}" "${SINGLETON_INODE:-?}" "$(now_iso)" \
++    >"$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
+ }
+ # singleton_acquire [LOCKFILE] → 0=已持有 / 4=冲突（另有在位 keeper） / 5=锁不可用
+ singleton_acquire() {
+-  local lf="${1:-$KEEPER_LOCK_FILE}" hp="" hraw="" alive=unknown tries=0
++  local lf="${1:-$KEEPER_LOCK_FILE}" hp="" hraw="" alive=unknown tries=0 err="" rc=0
++  local errf="$KEEPER_STATE_DIR/.flock.err.$$" holders="" hst now_st
+   mkdir -p "$(dirname "$lf")" 2>/dev/null
+-  exec 9>>"$lf" || { hlog "WARN 无法打开单例锁文件 $lf（见上一条 shell 错误）"; return 5; }
+-  if ! flock -n 9 2>/dev/null; then
+-    while [ "$tries" -lt 6 ]; do
+-      hraw="$(head -c 256 "$KEEPER_HOLDER_FILE" 2>/dev/null | tr -d '\n')"
+-      hp="$(printf '%s' "$hraw" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
+-      [ -n "$hp" ] && break
+-      sleep 0.1; tries=$((tries+1))
+-    done
+-    if [ -n "$hp" ]; then proc_exists "$hp" && alive=yes || alive=no; fi
+-    SINGLETON_HOLDER_PID="${hp:-unknown}"; SINGLETON_HOLDER_RAW="$hraw"; SINGLETON_HOLDER_ALIVE="$alive"
+-    audit singleton_conflict "" - \
+-      "$(ev holder_pid="${hp:-unknown}" self_pid="$$" lock_file="$lf" holder_alive="$alive" holder_record="${hraw:0:200}" action=exit exit_code=4 note="flock 单例锁被在位 keeper 持有：本实例拒绝启动，绝不与在位 keeper 互踩（防双 spawn/双 pidfile 写）")" \
+-      process "$(ev holder_pid="${hp:-unknown}" self_pid="$$")"
+-    exec 9>&-
+-    return 4
++  # ---- (a) flock 二进制存在性：缺失 ⇒ 明确"锁不可用"，绝不误报"冲突" ----
++  if ! command -v flock >/dev/null 2>&1; then
++    audit keeper_lock_unavailable "" - \
++      "$(ev reason=flock_binary_missing lock_file="$lf" self_pid="$$" rc=5 action=refuse_start note="flock 不存在：无法保证单例互斥，明确以 rc=5 拒绝启动（不再一律误报 singleton_conflict）")"
++    hlog "FATAL flock 不存在：单例锁不可用 ⇒ 拒绝启动 (rc=5)"
++    return 5
++  fi
++  # ---- (b) 打开锁文件：失败 ⇒ rc=5 + 错误文本取证 ----
++  if ! exec 9>>"$lf"; then
++    local err2; err2="$( bash -c 'exec 9>>"$1"' _ "$lf" 2>&1 >/dev/null )"
++    audit keeper_lock_unavailable "" - \
++      "$(ev reason=lock_open_failed lock_file="$lf" self_pid="$$" errno_text="$(printf '%s' "$err2" | head -c 160)" rc=5 action=refuse_start note="锁文件不可打开（权限/只读 fs/路径缺失）：区分于'冲突'")"
++    hlog "FATAL 无法打开单例锁文件 $lf：$(printf '%s' "$err2" | head -c 120)（rc=5）"
++    return 5
++  fi
++  # ---- (c) 抢锁（区分冲突 vs 不可用：errno 文本 + fdinfo 交叉取证）----
++  flock -n 9 2>"$errf"; rc=$?
++  err="$(head -c 200 "$errf" 2>/dev/null)"; rm -f "$errf" 2>/dev/null
++  if [ "$rc" != 0 ]; then
++    holders="$(singleton_holders_scan "$lf" 2>/dev/null | tr '\n' ';')"
++    if [ -z "$holders" ] && [ -n "$err" ]; then
++      # flock 报错且无任何进程持有该 inode ⇒ 判为"不可用"（ENOLCK/ENOTSUP/网络 fs 等）
++      exec 9>&-
++      audit keeper_lock_unavailable "" - \
++        "$(ev reason=flock_syscall_error lock_file="$lf" self_pid="$$" flock_errno_text="$(printf '%s' "$err" | tr -d '\n' | head -c 160)" holders="${holders:-none}" rc=5 action=refuse_start note="flock 报错且 fdinfo 扫描无持有者 ⇒ 锁机制不可用（非冲突），明确拒绝启动")"
++      hlog "FATAL flock 不可用：$(printf '%s' "$err" | head -c 120)（rc=5）"
++      return 5
++    fi
++    if [ -z "$holders" ]; then
++      # 无持有者但抢锁失败：疑竞态，短暂重试一次再定级
++      sleep 0.2 9>&-; flock -n 9 2>/dev/null; rc=$?
++      holders="$(singleton_holders_scan "$lf" 2>/dev/null | tr '\n' ';')"
++      if [ "$rc" != 0 ] && [ -z "$holders" ]; then
++        exec 9>&-
++        audit keeper_lock_unavailable "" - \
++          "$(ev reason=flock_failed_no_holder lock_file="$lf" self_pid="$$" flock_errno_text="$(printf '%s' "${err:-none}" | tr -d '\n' | head -c 160)" rc=5 action=refuse_start note="重试后仍抢锁失败且扫描不到持有者 ⇒ 判为锁不可用")"
++        hlog "FATAL 抢锁失败且无持有者 ⇒ 锁不可用（rc=5）"
++        return 5
++      fi
++    fi
++    if [ "$rc" != 0 ]; then
++      # 真冲突：持有者取证（fdinfo 优先，落盘记录仅作参考并交叉核对 starttime）
++      while [ "$tries" -lt 6 ]; do
++        hraw="$(head -c 256 "$KEEPER_HOLDER_FILE" 2>/dev/null | tr -d '\n')"
++        hp="$(printf '%s' "$hraw" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
++        [ -n "$hp" ] && break
++        sleep 0.1 9>&-; tries=$((tries+1))
++      done
++      SINGLETON_HOLDER_VERIFIED="no"
++      if [ -n "$hp" ] && [ -d "/proc/$hp" ]; then
++        alive=yes
++        hst="$(printf '%s' "$hraw" | sed -n 's/.*starttime=\([0-9]*\).*/\1/p')"
++        now_st="$(proc_starttime "$hp" 2>/dev/null || printf '?')"
++        if [ -z "$hst" ]; then SINGLETON_HOLDER_VERIFIED="unverified_no_starttime"
++        elif [ "$hst" = "$now_st" ]; then SINGLETON_HOLDER_VERIFIED="yes_starttime_ok"
++        else SINGLETON_HOLDER_VERIFIED="no_starttime_mismatch(record=$hst proc=$now_st)"; alive=no_pid_reuse; fi
++        case "$(proc_cmdline_text "$hp" 2>/dev/null)" in
++          *keeper-v3.sh*) : ;;
++          *) [ "$SINGLETON_HOLDER_VERIFIED" = yes_starttime_ok ] && SINGLETON_HOLDER_VERIFIED="no_cmdline_not_keeper" ;;
++        esac
++      elif [ -n "$hp" ]; then alive=no; SINGLETON_HOLDER_VERIFIED="no_record_dead"
++      else SINGLETON_HOLDER_VERIFIED="no_record_missing"; fi
++      # 落盘记录不可信时，用 fdinfo 实时读数指认持有者（C2b 修复：陈旧记录曾 15/24 错指认）
++      local phline phpid
++      phline="$(singleton_primary_holder "$lf" 2>/dev/null)"
++      phpid="$(printf '%s' "$phline" | sed -n 's/^pid=\([0-9]*\).*/\1/p')"
++      if [ "$SINGLETON_HOLDER_VERIFIED" != yes_starttime_ok ] && [ -n "$phpid" ]; then
++        hp="$phpid"; alive=yes
++        SINGLETON_HOLDER_VERIFIED="via_fdinfo_scan"
++      fi
++      SINGLETON_HOLDER_PID="${hp:-unknown}"; SINGLETON_HOLDER_RAW="$hraw"; SINGLETON_HOLDER_ALIVE="$alive"
++      audit singleton_conflict "" - \
++        "$(ev holder_pid="${hp:-unknown}" self_pid="$$" lock_file="$lf" lock_inode="$(lock_inode_of "$lf")" holder_alive="$alive" holder_verified="$SINGLETON_HOLDER_VERIFIED" holder_record_pid="$(printf '%s' "$hraw" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')" primary_holder="${phline:-none}" holders_scan="${holders:-none}" holder_record="${hraw:0:200}" flock_errno_text="$(printf '%s' "${err:-none}" | tr -d '\n' | head -c 120)" action=exit exit_code=4 note="flock 单例锁被在位 keeper 持有：本实例拒绝启动，绝不与在位 keeper 互踩；持有者以 fdinfo 交叉取证为准（落盘记录仅参考）")" \
++        process "$(ev holder_pid="${hp:-unknown}" self_pid="$$" holder_verified="$SINGLETON_HOLDER_VERIFIED")"
++      exec 9>&-
++      return 4
++    fi
+   fi
+-  printf 'pid=%s run_id=%s keeper=%s ts=%s\n' "$$" "$RUN_ID" "$KEEPER_VERSION" "$(now_iso)" >"$lf" 2>/dev/null
++  # ---- (d) 持锁成功：记录 inode + holder 记录（含 starttime/inode，供 K-1/K-5 交叉核对）----
++  SINGLETON_LOCK_PATH="$lf"
++  SINGLETON_INODE="$(lock_inode_of "$lf")"
++  printf 'pid=%s starttime=%s run_id=%s keeper=%s lock_inode=%s ts=%s\n' "$$" \
++    "$(proc_starttime $$ 2>/dev/null || printf '?')" "$RUN_ID" "$KEEPER_VERSION" "$SINGLETON_INODE" "$(now_iso)" \
++    >"$lf" 2>/dev/null
+   singleton_holder_write
+   SINGLETON_HELD=1
+-  audit singleton_acquired "" - "$(ev self_pid="$$" lock_file="$lf" holder_file="$KEEPER_HOLDER_FILE")"
++  audit singleton_acquired "" - "$(ev self_pid="$$" lock_file="$lf" lock_inode="$SINGLETON_INODE" holder_file="$KEEPER_HOLDER_FILE")"
+   return 0
+ }
++# singleton_check_inode —— K-1：每轮校验锁文件 inode，防「删锁重建 ⇒ 双持分裂脑」
++#   0=仍安全持有（必要时已在新 inode 上续持）；1=已让位（调用方必须停机退出）
++singleton_check_inode() {
++  [ "$SINGLETON_HELD" = 1 ] || return 0
++  [ "$KEEPER_LOCK_INODE_GUARD" = 1 ] || return 0
++  local lf="${SINGLETON_LOCK_PATH:-$KEEPER_LOCK_FILE}" now holders
++  now="$(lock_inode_of "$lf")"
++  [ -n "$now" ] && [ "$now" = "$SINGLETON_INODE" ] && return 0
++  audit keeper_lock_rotated "" - \
++    "$(ev reason=lock_inode_changed lock_file="$lf" held_inode="${SINGLETON_INODE:-?}" now_inode="${now:-missing}" self_pid="$$" action=reacquire_probe note="锁文件被删除/重建（或消失）：fd9 指向旧 inode，已不再互斥 ⇒ 立即在新 inode 上重新抢锁，失败则让位")"
++  exec 9>&- 2>/dev/null
++  if exec 9>>"$lf" 2>/dev/null && flock -n 9 2>/dev/null; then
++    SINGLETON_INODE="$(lock_inode_of "$lf")"
++    printf 'pid=%s starttime=%s run_id=%s keeper=%s lock_inode=%s ts=%s\n' "$$" \
++      "$(proc_starttime $$ 2>/dev/null || printf '?')" "$RUN_ID" "$KEEPER_VERSION" "$SINGLETON_INODE" "$(now_iso)" \
++      >"$lf" 2>/dev/null
++    singleton_holder_write
++    audit keeper_lock_rotated "" - \
++      "$(ev action=reacquired new_inode="$SINGLETON_INODE" lock_file="$lf" self_pid="$$" note="重新抢锁成功：仍为唯一持有者（分裂脑已避免）")"
++    return 0
++  fi
++  holders="$(singleton_holders_scan "$lf" 2>/dev/null | tr '\n' ';')"
++  audit singleton_conflict "" - \
++    "$(ev reason=lock_replaced_held_elsewhere lock_file="$lf" held_inode="${SINGLETON_INODE:-?}" now_inode="${now:-missing}" self_pid="$$" holders_scan="${holders:-none}" action=yield exit_code=6 note="锁文件被删/重建且新 inode 已被他人持有 ⇒ 本实例让位（绝不双持）")" \
++    process "$(ev self_pid="$$" reason=lock_replaced_held_elsewhere)"
++  SINGLETON_HELD=0
++  return 1
++}
+ # singleton_probe [LOCKFILE] → 0=空闲 / 1=有持有者（打印持有者） / 2=不可判定（只读，不抢锁）
+ singleton_probe() {
+-  local lf="${1:-$KEEPER_LOCK_FILE}" hp hraw
++  local lf="${1:-$KEEPER_LOCK_FILE}" hp hraw hst now_st holders rec_ok=stale
+   [ -e "$lf" ] || { printf 'free (锁文件不存在)\n'; return 0; }
+   if exec 8>>"$lf"; then
+     if flock -n 8 2>/dev/null; then
+@@ -1612,16 +2482,34 @@
+   else
+     printf 'unknown (锁文件不可打开)\n'; return 2
+   fi
++  # 已被持有：fdinfo 交叉取证（不信落盘记录）+ starttime 核对（K-5 防 PID 复用）
++  holders="$(singleton_holders_scan "$lf" 2>/dev/null | tr '\n' ';')"
++  local primary; primary="$(singleton_primary_holder "$lf" 2>/dev/null)"
+   hraw="$(head -c 256 "$KEEPER_HOLDER_FILE" 2>/dev/null | tr -d '\n')"
+   hp="$(printf '%s' "$hraw" | sed -n 's/.*pid=\([0-9]*\).*/\1/p')"
+-  if [ -n "$hp" ] && proc_exists "$hp"; then
+-    printf 'held pid=%s alive=yes record=%s\n' "$hp" "$hraw"; return 1
+-  fi
+-  printf 'held pid=%s alive=no record=%s\n' "${hp:-unknown}" "${hraw:-none}"; return 1
++  hst="$(printf '%s' "$hraw" | sed -n 's/.*starttime=\([0-9]*\).*/\1/p')"
++  if [ -n "$hp" ] && [ -d "/proc/$hp" ]; then
++    now_st="$(proc_starttime "$hp" 2>/dev/null || printf '?')"
++    if [ -z "$hst" ]; then rec_ok=unverified_no_starttime
++    elif [ "$hst" = "$now_st" ]; then rec_ok=yes_starttime_ok
++    else rec_ok="no_starttime_mismatch(record=$hst proc=$now_st)"; fi
++  elif [ -n "$hp" ]; then rec_ok=no_record_dead
++  else rec_ok=no_record_missing; fi
++  if [ -n "$hp" ] && [ "$rec_ok" = yes_starttime_ok ]; then
++    printf 'held pid=%s alive=yes record_verified=%s primary_holder=%s holders_scan=[%s] record=%s\n' \
++      "$hp" "$rec_ok" "${primary:-none}" "${holders:-none}" "$hraw"; return 1
++  fi
++  # 落盘记录不可信（缺失/陈旧/starttime 不符）⇒ 用 fdinfo 实时读数指认持有者
++  # （crit-adversarial C2b：陈旧 holder 记录曾造成 15/24 错指认）
++  local pprim; pprim="$(printf '%s' "$primary" | sed -n 's/^pid=\([0-9]*\).*/\1/p')"
++  printf 'held pid=%s alive=%s record_verified=%s primary_holder=%s holders_scan=[%s] record=%s\n' \
++    "${pprim:-${hp:-unknown}}" "$([ -n "$pprim" ] && printf yes || printf unknown)" "$rec_ok" \
++    "${primary:-none}" "${holders:-none}" "${hraw:-none}"
++  return 1
+ }
+ singleton_release() {
+   [ "$SINGLETON_HELD" = 1 ] || return 0
+-  audit singleton_released "" - "$(ev self_pid="$$" lock_file="$KEEPER_LOCK_FILE")"
++  audit singleton_released "" - "$(ev self_pid="$$" lock_file="${SINGLETON_LOCK_PATH:-$KEEPER_LOCK_FILE}" lock_inode="${SINGLETON_INODE:-?}")"
+   rm -f "$KEEPER_HOLDER_FILE" 2>/dev/null
+   exec 9>&-
+   SINGLETON_HELD=0
+@@ -1673,7 +2561,7 @@
+   [ "$KEEPER_HB_ENABLE" = 1 ] || { printf 'hb_available=0\nhb_problem=disabled\n'; return 1; }
+   [ -r "$KEEPER_HEARTBEAT_PY" ] || { printf 'hb_available=0\nhb_problem=heartbeat_py_missing(%s)\n' "$KEEPER_HEARTBEAT_PY"; return 1; }
+   command -v python3 >/dev/null 2>&1 || { printf 'hb_available=0\nhb_problem=python3_missing\n'; return 1; }
+-  timeout "$KEEPER_HB_TIMEOUT" python3 - "$KEEPER_HEARTBEAT_PY" "$f" "${KEEPER_HB_STALL_S:-}" <<'PY' 2>/dev/null
++  timeout "$KEEPER_HB_TIMEOUT" python3 - "$KEEPER_HEARTBEAT_PY" "$f" "${KEEPER_HB_STALL_S:-}" <<'PY' 2>/dev/null 9>&-
+ import importlib.util, sys
+ hbpy, hbfile, thr = sys.argv[1], sys.argv[2], sys.argv[3]
+ try:
+@@ -1856,8 +2744,8 @@
+   JOBS_TODO=0; JOBS_DONE=0; JOBS_PENDING_NAMES=""; JOBS_DONE_NAMES=""
+   local i
+   for ((i=0; i<${#JOB_NAME[@]}; i++)); do
+-    if job_complete "$i"; then
+-      JOBS_DONE=$((JOBS_DONE+1)); JOBS_DONE_NAMES+="${JOB_NAME[$i]} "
++    if job_settled "$i"; then
++      JOBS_DONE=$((JOBS_DONE+1)); JOBS_DONE_NAMES+="${JOB_NAME[$i]}(${TERM_VERDICT:-completed}) "
+     else
+       JOBS_TODO=$((JOBS_TODO+1)); JOBS_PENDING_NAMES+="${JOB_NAME[$i]} "
+     fi
+@@ -1881,7 +2769,7 @@
+     return 0
+   fi
+   WAIT_CHILDREN_PENDING=1
+-  while [ "$w" -lt $((grace * 4)) ] && proc_exists "$SPAWN_CHILD_PID"; do sleep 0.25; w=$((w+1)); done
++  while [ "$w" -lt $((grace * 4)) ] && proc_exists "$SPAWN_CHILD_PID"; do sleep 0.25 9>&-; w=$((w+1)); done
+   WAIT_CHILDREN_WAITED="${SPAWN_CHILD_PID}($((w*250))ms)"
+   return 0
+ }
+@@ -1890,8 +2778,8 @@
+   local f="$KEEPER_STATE_DIR/keeper-v3.checkpoint.json"
+   local tmp="$f.tmp.$$"
+   for ((i=0; i<${#JOB_NAME[@]}; i++)); do
+-    cpl=no; job_complete "$i" && cpl=yes
+-    jobs+="$sep\"$(jesc "${JOB_NAME[$i]}")\":$(ev state="$(st_get last_state_${JOB_NAME[$i]})" pid="$(st_get last_pid_${JOB_NAME[$i]})" trust="$(st_get last_trust_${JOB_NAME[$i]})" restarts="$(st_get restarts_${JOB_NAME[$i]})" hb_class="$(st_get hb_class_${JOB_NAME[$i]})" complete="$cpl")"
++    cpl=no; job_settled "$i" && cpl=yes
++    jobs+="$sep\"$(jesc "${JOB_NAME[$i]}")\":$(ev state="$(st_get last_state_${JOB_NAME[$i]})" pid="$(st_get last_pid_${JOB_NAME[$i]})" trust="$(st_get last_trust_${JOB_NAME[$i]})" restarts="$(st_get restarts_${JOB_NAME[$i]})" hb_class="$(st_get hb_class_${JOB_NAME[$i]})" complete="$cpl" settled_verdict="${TERM_VERDICT:-none}" settled_source="${TERM_SOURCE:-none}" exit_code="$(st_get exit_code_${JOB_NAME[$i]})" halted="$(st_get halted_${JOB_NAME[$i]})" halt_reason="$(st_get halt_reason_${JOB_NAME[$i]})" incomplete_restarts="$(st_get incomplete_restarts_${JOB_NAME[$i]})" resume_restarts="$(st_get resume_restarts_${JOB_NAME[$i]})" fail_count="$(st_get fail_${JOB_NAME[$i]})")"
+     sep=','
+   done
+   jobs+='}'
+@@ -1944,6 +2832,7 @@
+   lock-probe)  cmd_lock_probe "${2:-}" ;;
+   identity)    [ -r "$KEEPER_CONF" ] && . "$KEEPER_CONF"; shift; cmd_identity "${1:-}" "${2:-}" ;;
+   spawn)       [ -r "$KEEPER_CONF" ] && . "$KEEPER_CONF"; rails_apply; shift; cmd_spawn "${1:-}" ;;
++  resume)      [ -r "$KEEPER_CONF" ] && . "$KEEPER_CONF"; shift; cmd_resume "${1:-all}" ;;
+   stop)        [ -r "$KEEPER_CONF" ] && . "$KEEPER_CONF"; cmd_stop ;;
+   selftest)    cmd_selftest ;;
+   ''|-h|--help|help) usage ;;

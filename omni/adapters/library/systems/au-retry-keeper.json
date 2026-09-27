@@ -1,0 +1,15 @@
+{
+  "name": "au-retry-keeper",
+  "label": "R3-P4 audit-unify：slot-retry scrape.py（只读原件）+ 对齐后的 audit.py（v2）+ keeper-v3.sh（v2）",
+  "scrape": "/tmp/lib-opt-work/R3/impl/slot-retry/scrape.py",
+  "memguard": "/tmp/lib-opt-work/R3/refs/memguard.py",
+  "heartbeat": "/tmp/lib-opt-work/R3/refs/heartbeat.py",
+  "keeper": "/tmp/lib-opt-work/R3p4/slot-audit-unify/prod/keeper-v3.sh",
+  "fallbacks": {"keeper": "/tmp/lib-opt-work/R3/refs/keeper-v2.sh"},
+  "extra_modules": ["/tmp/lib-opt-work/R3p4/slot-audit-unify/prod/audit.py"],
+  "strict": ["scrape", "keeper"],
+  "job_name": "v8",
+  "complete_marker": "全部完成",
+  "keeper_tick": 5,
+  "recovery_deadline": 180
+}

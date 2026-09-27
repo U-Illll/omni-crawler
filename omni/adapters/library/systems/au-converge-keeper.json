@@ -1,0 +1,14 @@
+{
+  "name": "au-converge-keeper",
+  "label": "R3-P4 audit-unify：对齐后的 slot-converge scrape.py（审计段 v2）+ slot-keeper3 keeper-v3.sh（审计段 v2）",
+  "scrape": "/tmp/lib-opt-work/R3p4/slot-audit-unify/prod/scrape-converge.py",
+  "memguard": "/tmp/lib-opt-work/R3/refs/memguard.py",
+  "heartbeat": "/tmp/lib-opt-work/R3/refs/heartbeat.py",
+  "keeper": "/tmp/lib-opt-work/R3p4/slot-audit-unify/prod/keeper-v3.sh",
+  "fallbacks": {"keeper": "/tmp/lib-opt-work/R3/refs/keeper-v2.sh"},
+  "strict": ["scrape", "keeper"],
+  "job_name": "v8",
+  "complete_marker": "全部完成",
+  "keeper_tick": 5,
+  "recovery_deadline": 180
+}

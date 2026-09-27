@@ -1,0 +1,71 @@
+--- a/scrape.py
++++ b/scrape.py
+@@ -1763,9 +1763,19 @@
+ RETRY_ENFORCE_MIN = _env_num('SCRAPE_RETRY_ENFORCE_MIN', 1, int) == 1   # v2 下补齐 C1 下限
+ RETRY_MAX_ATTEMPTS = _env_num('SCRAPE_RETRY_MAX_ATTEMPTS', 12, int)     # 尝试次数**硬上限**（不可被下限突破）
+ # R-2：抖动形式由「乘性 U(0.75,1.25)」改为 **equal jitter**（见 _retry_wait_plan）。
+-# 这两个常量保留为**历史读数口径**（旧报告/对照脚本引用），不再参与退避计算。
+-RETRY_JITTER_LO = 0.75                        # 【弃用】旧乘性抖动下界（保留仅为兼容引用）
+-RETRY_JITTER_HI = 1.25                        # 【弃用】旧乘性抖动上界（保留仅为兼容引用）
++# R-8（P4.5·v2.1）：**旧的 RETRY_JITTER_LO/HI 已删除**。它们是"乘性抖动"的口径
++#   （wait = d × U(0.75,1.25)，E[wait] = 1.00·d），与本实现不符；保留导出会让读者
++#   （验收探针 / 报告读者）拿到错误口径：例如按 [0.75,1.25]×d 判"样本是否越界"会把
++#   equal jitter 合法落在 [0.5·d, 0.75·d) 的样本误判为越界。
++#   现行口径（唯一权威：`_retry_wait_band` / `_retry_wait_plan`）：
++#     d = min(cap, base·factor^att)；wait = d/2 + U(0, d/2)
++#     ⇒ wait/d ∈ [RETRY_JITTER_BAND]，E[wait] = RETRY_JITTER_MEAN·d = 0.75·d。
++#   与乘性基线相比：期望等待**收紧 25%**（1.00·d → 0.75·d），上界由 1.25·d 降到 1.00·d
++#   （更保守）；这是 retry-fatal 的**已知取舍**（抖动不再可能超过 d，cap 语义更干净），
++#   代价是同一档位的等待分布整体左移（对限流场景是更激进的试探，故保留 cap 与全局
++#   cooldown 归属不变）。读数对账请用 RETRY_JITTER_BAND/MEAN 或直接调 `_retry_wait_band`。
++RETRY_JITTER_BAND = (0.5, 1.0)                # wait/d 的取值带（equal jitter 下界、上界）
++RETRY_JITTER_MEAN = 0.75                      # E[wait]/d（= 带的均值；读数对账用）
+ # 每类错误的指数退避参数：class -> (base_s, factor, cap_s)
+ #   d = min(cap, base × factor^att)；wait = d/2 + U(0, d/2)（equal jitter）
+ RETRY_BACKOFF = {
+@@ -1943,6 +1953,9 @@
+     """退避档位的 (lo, hi)：equal jitter 下 wait ∈ [d/2, d]，d = min(cap, base·factor^att)。
+ 
+     这是 _retry_wait_plan 的**解析上界**，供单测断言 R-B2 的两条性质（cap / 首档 / 单调）。
++    R-8（v2.1）：本函数与 `RETRY_JITTER_BAND`/`RETRY_JITTER_MEAN` 是抖动口径的**唯一权威**；
++    旧的 `RETRY_JITTER_LO/HI`（乘性口径）已删除，不得再按 [0.75,1.25]×d 判越界。
++    返回的 (lo, hi) 与 RETRY_JITTER_BAND 的关系：lo = BAND[0]·d，hi = BAND[1]·d。
+     """
+     base, factor, cap = RETRY_BACKOFF.get(cls, RETRY_BACKOFF['other'])
+     d = float(base) * (float(factor) ** int(att))
+@@ -2336,6 +2349,14 @@
+ # ===========================================================================
+ 
+ R3_AUDIT_SCHEMA = 'r3-audit-v2'    # R3-P4 契约 v2 §1：三写者统一 schema 值（原 r3-audit-v1）
++# R3-P4·P4.5 契约 v2.1 §8.1（KI-1 修复）：**写者分组键**。
++#   本进程内有两个审计写者共用同一 pid 与同一 OUT/audit.jsonl：
++#     ① 本文件的块级写者 audit_event()（_AUDIT_SEQ，本常量 = "converge"）；
++#     ② 请求级写者 audit.py（经 _retry_audit 懒加载，其 _ST['seq']，writer = "retry"）。
++#   二者的 seq 计数器互相独立 ⇒ 只按 pid 分组会让合流文件出现 seq_duplicate
++#   （p4-verify 在真实 S4 上复现：pid=8631 seq=1/2/3 重复）。故每行都写 writer，
++#   校验器按 (文件, pid, writer) 分组（契约 §8.2/§8.4）。
++R3_AUDIT_WRITER = 'converge'       # 契约 v2.1 §8.1：块级（converge 侧）写者身份
+ EXIT_CONVERGED = 0
+ EXIT_INCOMPLETE = int(_env_num('SCRAPE_INCOMPLETE_EXIT', 3, int))   # 未收敛退出码（可配 0 兼容旧 keeper）
+ EXIT_STALL_STOP = int(_env_num('SCRAPE_STALL_EXIT', 4, int))
+@@ -2428,7 +2449,10 @@
+     """写一行结构化自愈审计事件（C3：每级自愈事件都必须有结构化记录）。
+ 
+     永不抛异常、永不阻塞数据面：审计是**观测面**，任何失败都只能降级为计数丢失
+-    （审计自身写失败 → 尝试重建 output 目录重写一次 → 仍失败则丢弃该事件并计数）。"""
++    （审计自身写失败 → 尝试重建 output 目录重写一次 → 仍失败则丢弃该事件并计数）。
++
++    契约 v2.1 §8.1：本行带 `writer=R3_AUDIT_WRITER`（"converge"）——本函数的 `_AUDIT_SEQ`
++    与 audit.py（"retry"）的 seq 是两个独立计数器，校验器按 (文件, pid, writer) 分组。"""
+     global _AUDIT_SEQ, _AUDIT_DROPPED
+     try:
+         with _AUDIT_LOCK:
+@@ -2436,7 +2460,7 @@
+             ev = {'schema': R3_AUDIT_SCHEMA,
+                   'ts_epoch': round(time.time(), 3),      # 契约 v2：权威时间键
+                   'ts_iso': datetime.now().isoformat(timespec='milliseconds'),
+-                  'pid': os.getpid(), 'seq': _AUDIT_SEQ,
++                  'pid': os.getpid(), 'writer': R3_AUDIT_WRITER, 'seq': _AUDIT_SEQ,
+                   'level': level, 'event': event, 'run': run or _r3_run_id(),
+                   'detail': detail if isinstance(detail, dict) else {'value': detail}}
+             blob = (json.dumps(ev, ensure_ascii=False) + '\n').encode('utf-8')
